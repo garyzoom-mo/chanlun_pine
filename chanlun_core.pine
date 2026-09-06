@@ -1,5 +1,5 @@
 //@version=6
-// 缠论核心 v1.2.0 - M1-M6: 笔构建重写（两阶段扫描）+ 全链路缠论
+// 缠论核心 v1.2.1 - 修复历史分型/买卖点可见性，补充最近信号、止损线与确认提醒
 // 遵循禅师原文"教你炒股票"系列定义
 
 indicator("缠论 - 分型与笔 [Chanlun Core]", "缠论核心", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
@@ -165,9 +165,18 @@ type Prediction
 // INPUT PARAMETERS
 // ============================================================
 
+// --- 显示设置（控制图面拥挤与 TradingView 对象预算）---
+bool showFractalMarkersInput = input.bool(true, "显示分型三角 (红▼/绿▲)", group="显示设置",
+    tooltip="用可回填历史的三角 label 显示最近分型。原 plotshape 在历史计算结束后才拿到分型数组，无法反向补画，故改用 label.new")
+bool showFractalLabels       = input.bool(false, "显示分型文字 (顶/底)", group="显示设置",
+    tooltip="默认关闭，避免密集的顶/底文字遮挡 B/S。需要研究分型时再开启")
+int maxFractalDisplayInput   = input.int(100, "最多显示最近分型数", minval=20, maxval=200, group="显示设置",
+    tooltip="三角和文字分别受此数量限制。TradingView 全图最多 500 个 label，限制分型数量可为买卖点及止损保留配额")
+int maxSignalLabelsInput     = input.int(150, "最多显示最近买卖点数", minval=20, maxval=300, group="显示设置",
+    tooltip="优先显示最近的 B1/B2/B3/S1/S2/S3。信号标签包含触发价、质量和参考止损")
+
 // 调试开关（默认关闭，测试用）
 bool showContainmentDebug = input.bool(false, "显示包含处理过程", group="调试", tooltip="开启后高亮被合并的K线，显示合并前后对比")
-bool showFractalLabels    = input.bool(false, "显示分型文字标签",  group="调试", tooltip="显示顶/底分型的文字标签。每个分型占用 1 个 label 配额，图上分型数量远多于买卖点，开启后会挤掉 B/S 信号标签（TradingView 上限 500，只保留最新创建的）。默认关闭，只保留红▼/绿▲三角")
 bool showBuildBiDebugInput = input.bool(false, "显示 buildBi 诊断日志", group="调试",
     tooltip="在 needFullRebuild 时打印 buildBi 两阶段扫描的诊断日志，用于验证笔构建逻辑。默认关闭，测试场景 A/B/C 时开启")
 
@@ -222,6 +231,10 @@ int   stopLossAtrPeriodInput      = input.int(14,   "ATR 周期", minval=5, maxv
     tooltip="用于计算动态止损距离的 ATR 周期。14=约三周日线波动率")
 float stopLossAtrMultiplierInput  = input.float(1.5, "ATR 倍数", minval=0.5, maxval=5.0, step=0.1, group="止损设置",
     tooltip="止损距离 = max(ATR×倍数, 价格×2%)。倍数越大止损越宽")
+bool showLatestStopLinesInput     = input.bool(true, "显示最近买/卖参考止损线", group="止损设置",
+    tooltip="分别绘制最近一个买点和卖点的参考止损水平线；这是结构化风控参考，不是自动交易指令")
+int latestStopMaxAgeInput         = input.int(120, "止损线最大保留K线", minval=10, maxval=1000, group="止损设置",
+    tooltip="只显示距离当前不超过该数量K线的最近信号止损，避免很久以前的止损线误导当前决策")
 
 // --- 信号过滤设置 (M4) ---
 bool showSignalQualityInput = input.bool(true, "显示信号质量评分", group="信号过滤",
@@ -238,6 +251,10 @@ float atrCurrent = ta.atr(stopLossAtrPeriodInput)
 
 // MA 趋势值（M4 信号过滤用，全局作用域，函数内可直接引用）
 float maTrendValue = ta.sma(close, maTrendPeriodInput)
+
+// MACD 必须在每次脚本执行的全局作用域计算，确认收盘时只把当前柱值存入数组。
+// 避免 ta.macd() 放在条件作用域导致 Pine 的历史一致性警告。
+[_, _, macdHistCurrent] = ta.macd(close, macdFastInput, macdSlowInput, macdSignalInput)
 
 // ============================================================
 // 功能1: 包含判断 - hasContainment()
@@ -1067,51 +1084,87 @@ getStopLossForSignal(sType, entryPrice, refPrice, zd, zg, atrValue) =>
         SignalType.S2 => na(refPrice) ? entryPrice + pctDist : refPrice
         SignalType.S3 => na(zg) ? entryPrice + pctDist : zg
 
+// @function  使用信号形成当根K线的 ATR 计算历史止损，并解析 B2/S2、B3/S3 的结构参考价。
+// 原实现重建所有历史标签时统一使用最后一根K线的 atrCurrent，会令历史 B1/S1 止损漂移。
+getStoredStopLoss(sig, firstSignalsArg, zhongShuArg, atrValuesArg) =>
+    float refPrice = na
+    float zd = na
+    float zg = na
+
+    if sig.sType == SignalType.B2
+        for fs in firstSignalsArg
+            if fs.sType == SignalType.B1 and fs.refIndex == sig.refIndex
+                refPrice := fs.price
+                break
+    else if sig.sType == SignalType.S2
+        for fs in firstSignalsArg
+            if fs.sType == SignalType.S1 and fs.refIndex == sig.refIndex
+                refPrice := fs.price
+                break
+
+    if (sig.sType == SignalType.B3 or sig.sType == SignalType.S3) and sig.refIndex >= 0 and sig.refIndex < zhongShuArg.size()
+        zs = zhongShuArg.get(sig.refIndex)
+        zd := zs.initialZD
+        zg := zs.initialZG
+
+    float signalAtr = atrCurrent
+    if sig.barIndex >= 0 and sig.barIndex < atrValuesArg.size()
+        storedAtr = atrValuesArg.get(sig.barIndex)
+        if not na(storedAtr)
+            signalAtr := storedAtr
+
+    getStopLossForSignal(sig.sType, sig.price, refPrice, zd, zg, signalAtr)
+
 // ============================================================
 // 功能12d: 趋势状态检测 - getTrendState()
 // ============================================================
 
-// @function  基于最近 N 笔的区间比较判断当前趋势状态
+// @function  基于信号形成时已经确认的笔判断趋势状态，而不是用图表最后时刻的趋势回评历史。
 // @param     strokes array<Stroke> - 笔数组
 // @param     lookback int - 比较窗口大小（默认 5）
+// @param     endBarIndex int - 只使用 endOrigIndex <= 此值的笔
 // @returns   string - "上升" / "下降" / "盘整"
 //
-// 算法：取最近 lookback 笔的最高高点和最低低点，与之前 lookback 笔比较。
-// - 近期高点 > 前期高点 AND 近期低点 > 前期低点 → "上升"
-// - 近期高点 < 前期高点 AND 近期低点 < 前期低点 → "下降"
-// - 其他 → "盘整"
-getTrendState(strokes, lookback) =>
-    n = strokes.size()
-    if n < lookback * 2
+// 算法：取截至 endBarIndex 最近 lookback 笔的区间，与之前 lookback 笔比较。
+getTrendStateAt(strokes, lookback, endBarIndex) =>
+    int endStrokeIdx = -1
+    int strokeIdx = 0
+    for s in strokes
+        if s.endOrigIndex <= endBarIndex
+            endStrokeIdx := strokeIdx
+        else
+            break
+        strokeIdx += 1
+
+    available = endStrokeIdx + 1
+    if available < lookback * 2
         "盘整"
-
-    count = math.min(lookback, math.floor(n / 2))
-    recentStart = n - count
-
-    // 近期区间
-    recentHigh = -1e18
-    recentLow  =  1e18
-    for i = recentStart to n - 1
-        [sLow, sHigh] = getStrokeRange(strokes.get(i))
-        recentHigh := math.max(recentHigh, sHigh)
-        recentLow  := math.min(recentLow, sLow)
-
-    // 前期区间
-    priorStart = math.max(0, recentStart - count)
-    priorEnd   = recentStart - 1
-    priorHigh  = -1e18
-    priorLow   =  1e18
-    for i = priorStart to priorEnd
-        [sLow, sHigh] = getStrokeRange(strokes.get(i))
-        priorHigh := math.max(priorHigh, sHigh)
-        priorLow  := math.min(priorLow, sLow)
-
-    if recentHigh > priorHigh and recentLow > priorLow
-        "上升"
-    else if recentHigh < priorHigh and recentLow < priorLow
-        "下降"
     else
-        "盘整"
+        recentStart = available - lookback
+        recentEnd = available - 1
+
+        recentHigh = -1e18
+        recentLow  =  1e18
+        for i = recentStart to recentEnd
+            [sLow, sHigh] = getStrokeRange(strokes.get(i))
+            recentHigh := math.max(recentHigh, sHigh)
+            recentLow  := math.min(recentLow, sLow)
+
+        priorStart = recentStart - lookback
+        priorEnd = recentStart - 1
+        priorHigh = -1e18
+        priorLow  =  1e18
+        for i = priorStart to priorEnd
+            [sLow, sHigh] = getStrokeRange(strokes.get(i))
+            priorHigh := math.max(priorHigh, sHigh)
+            priorLow  := math.min(priorLow, sLow)
+
+        if recentHigh > priorHigh and recentLow > priorLow
+            "上升"
+        else if recentHigh < priorHigh and recentLow < priorLow
+            "下降"
+        else
+            "盘整"
 
 // ============================================================
 // 功能12e: 信号质量评分 - scoreSignal()
@@ -1405,7 +1458,7 @@ computePredictions(strokes, zhongShuList, trendBCSignals, allFilteredSignals) =>
 // --- 持久化数据 ---
 // mergedBars: 包含处理后的K线序列，增量构建
 // mergedHighMap / mergedLowMap / mergedCountMap: 原始 bar_index → 合并后属性的映射表
-// fractals: 原始分型序列（未经交替过滤，仅用于 plotshape 三角标记和文字标签）
+// fractals: 原始分型序列（未经交替过滤，用于历史三角/文字回填和笔构建）
 var array<MergedBar> mergedBars      = array.new<MergedBar>()
 var array<float>    mergedHighMap    = array.new<float>()
 var array<float>    mergedLowMap     = array.new<float>()
@@ -1413,16 +1466,20 @@ var array<int>      mergedCountMap   = array.new<int>()
 var array<Fractal>  fractals         = array.new<Fractal>()
 var array<Stroke>   strokes          = array.new<Stroke>()
 var array<ZhongShu> zhongShuList     = array.new<ZhongShu>()
-var array<int>      barTimes         = array.new<int>()  // 每根原始 bar 的 time 时间戳
+var array<int>      barTimes         = array.new<int>()    // 每根原始 bar 的 time 时间戳
 var array<float>    macdHistValues   = array.new<float>()  // 每根原始 bar 的 MACD 柱值
+var array<float>    atrValues        = array.new<float>()  // 每根原始 bar 的 ATR；历史信号止损必须使用形成当时的波动率
+var array<float>    closeValues      = array.new<float>()  // 历史信号形成时的收盘价
+var array<float>    maTrendValues    = array.new<float>()  // 历史信号形成时的 MA，避免用当前 MA 过滤全部历史信号
 var array<BeiChiSignal> trendBeiChiSignals = array.new<BeiChiSignal>()  // 趋势背驰信号
 var array<BeiChiSignal> consolidBeiChiSignals = array.new<BeiChiSignal>()  // 盘整背驰信号
 var array<TradingSignal> firstSignals        = array.new<TradingSignal>()  // 第一类买卖点 B1/S1
 var array<TradingSignal> thirdSignals        = array.new<TradingSignal>()  // 第三类买卖点 B3/S3
 var array<TradingSignal> secondSignals       = array.new<TradingSignal>()  // 第二类买卖点 B2/S2
 var array<TradingSignal> allFilteredSignals  = array.new<TradingSignal>()  // 过滤后的所有买卖点
-var array<label>     fractalLabels      = array.new<label>()       // 分型文字标签（跟踪生命周期，防止泄漏）
-var array<label>     debugMergeLabels   = array.new<label>()       // 调试模式"X合"标签（跟踪生命周期，防止泄漏）
+var array<label>     fractalLabels       = array.new<label>()       // 分型文字标签（跟踪生命周期，防止泄漏）
+var array<label>     fractalMarkerLabels = array.new<label>()       // 分型三角；label.new 可在全量重建时反向回填历史
+var array<label>     debugMergeLabels    = array.new<label>()       // 调试模式"X合"标签（跟踪生命周期，防止泄漏）
 var array<Prediction> cachedPredictions  = array.new<Prediction>() // 预判结果缓存（面板和告警复用）
 var bool             predictionsCached  = false                   // 当前 bar 是否已有缓存
 
@@ -1433,8 +1490,10 @@ if barstate.isconfirmed
     )
     mergedBars.push(rawBar)
     barTimes.push(time)
-    [_, _, macdHist] = ta.macd(close, macdFastInput, macdSlowInput, macdSignalInput)
-    macdHistValues.push(macdHist)
+    macdHistValues.push(macdHistCurrent)
+    atrValues.push(atrCurrent)
+    closeValues.push(close)
+    maTrendValues.push(maTrendValue)
 
     if mergedBars.size() >= 2
         i = mergedBars.size() - 1
@@ -1478,7 +1537,7 @@ if needFullRebuild
     // 识别所有分型 → 不再预过滤（同向分型处理已内化到 buildBi）
     rawFractals = identifyFractals(mergedBars)
 
-    // fractals 数组仅用于 plotshape 分型三角标记，使用原始分型即可
+    // 可视化使用原始分型（含被笔算法跳过的同向分型）
     fractals.clear()
     for f in rawFractals
         fractals.push(f)
@@ -1706,7 +1765,7 @@ if needFullRebuild
 
 // --- 3b. 背驰信号标记 ---
 // 策略：在 needFullRebuild 时删除旧标签，重新创建。
-// 趋势背驰：红色"顶背"/绿色"底背"标签 + plotshape 箭头
+// 趋势背驰：红色"顶背"/绿色"底背"标签
 // 盘整背驰：蓝色/橙色较小标签，独立开关控制
 var array<label> beiChiLabels = array.new<label>()
 
@@ -1758,38 +1817,46 @@ if needFullRebuild
             )
             beiChiLabels.push(bcLabel)
 
-// --- 4c. 分型文字标签 ---
-// 策略：与笔线/中枢/背驰/信号标签一致，needFullRebuild 时删除重建。
-// plotshape 三角标记保持声明式（不泄漏）。
+// --- 4c. 分型三角/文字 ---
+// 分型数组在历史加载完成后才全量生成，因此逐 bar 的 plotshape 无法反向补画历史。
+// 改用带 xloc.bar_time 的 label.new 回填，并只创建最近 N 个，避免挤占买卖点配额。
 if needFullRebuild
     for oldLabel in fractalLabels
         oldLabel.delete()
     fractalLabels.clear()
+    for oldMarker in fractalMarkerLabels
+        oldMarker.delete()
+    fractalMarkerLabels.clear()
 
-    if showFractalLabels
-        for f in fractals
+    fractalCount = fractals.size()
+    if fractalCount > 0 and (showFractalMarkersInput or showFractalLabels)
+        fractalStart = math.max(0, fractalCount - maxFractalDisplayInput)
+        for fractalIdx = fractalStart to fractalCount - 1
+            f = fractals.get(fractalIdx)
             fTime = barTimes.get(f.originalIndex)
-            if f.fType == FractalType.TOP
-                fractalLabels.push(label.new(
-                  fTime, f.price,
-                  "顶",
-                  style=label.style_label_down,
-                  color=color.red,
+            isTop = f.fType == FractalType.TOP
+
+            if showFractalMarkersInput
+                fractalMarkerLabels.push(label.new(
+                  fTime, f.price, "",
+                  style=isTop ? label.style_triangledown : label.style_triangleup,
+                  color=isTop ? color.new(color.red, 25) : color.new(color.lime, 25),
                   textcolor=color.white,
-                  size=size.small,
+                  size=size.tiny,
                   xloc=xloc.bar_time,
-                  yloc=yloc.abovebar
+                  yloc=isTop ? yloc.abovebar : yloc.belowbar
                 ))
-            else if f.fType == FractalType.BOTTOM
+
+            if showFractalLabels
                 fractalLabels.push(label.new(
                   fTime, f.price,
-                  "底",
-                  style=label.style_label_up,
-                  color=color.green,
+                  isTop ? "顶" : "底",
+                  style=isTop ? label.style_label_down : label.style_label_up,
+                  color=isTop ? color.new(color.red, 10) : color.new(color.green, 10),
                   textcolor=color.white,
-                  size=size.small,
+                  size=size.tiny,
                   xloc=xloc.bar_time,
-                  yloc=yloc.belowbar
+                  yloc=isTop ? yloc.abovebar : yloc.belowbar
                 ))
 
 // --- 4b. 买卖点信号标记 ---
@@ -1803,115 +1870,165 @@ if needFullRebuild
         oldLabel.delete()
     signalLabels.clear()
 
-    // M4: 趋势状态（依赖 strokes，循环中不变，只算一次）
-    string trendState = "盘整"
-    if showSignalQualityInput
-        trendState := getTrendState(strokes, 5)
+    signalCount = allFilteredSignals.size()
+    if signalCount > 0
+        // 信号比普通分型重要，只保留最近 N 个且最后创建，确保 label 配额紧张时仍优先可见。
+        signalStart = math.max(0, signalCount - maxSignalLabelsInput)
+        for signalIdx = signalStart to signalCount - 1
+            sig = allFilteredSignals.get(signalIdx)
+            // 买点/卖点总开关
+            isBuy  = sig.sType == SignalType.B1 or sig.sType == SignalType.B2 or sig.sType == SignalType.B3
+            isSell = sig.sType == SignalType.S1 or sig.sType == SignalType.S2 or sig.sType == SignalType.S3
 
-    for sig in allFilteredSignals
-        // 买点/卖点总开关
-        isBuy  = sig.sType == SignalType.B1 or sig.sType == SignalType.B2 or sig.sType == SignalType.B3
-        isSell = sig.sType == SignalType.S1 or sig.sType == SignalType.S2 or sig.sType == SignalType.S3
+            if (isBuy and not showBuySignalsInput) or (isSell and not showSellSignalsInput)
+                continue
 
-        if (isBuy and not showBuySignalsInput) or (isSell and not showSellSignalsInput)
-            continue
+            sigTime = barTimes.get(sig.barIndex)
+            sigPrice = sig.price
 
-        sigTime = barTimes.get(sig.barIndex)
-        sigPrice = sig.price
+            // 颜色：绿色系买点，红色系卖点，强度越强越不透明
+            sigColor = switch sig.sType
+                SignalType.B1 => color.green
+                SignalType.B2 => color.new(color.green, 25)
+                SignalType.B3 => color.new(color.green, 55)
+                SignalType.S1 => color.red
+                SignalType.S2 => color.new(color.red, 25)
+                SignalType.S3 => color.new(color.red, 55)
 
-        // 颜色：绿色系买点，红色系卖点，强度越强越不透明
-        sigColor = switch sig.sType
-            SignalType.B1 => color.green
-            SignalType.B2 => color.new(color.green, 25)
-            SignalType.B3 => color.new(color.green, 55)
-            SignalType.S1 => color.red
-            SignalType.S2 => color.new(color.red, 25)
-            SignalType.S3 => color.new(color.red, 55)
+            sigStyle = isBuy ? label.style_label_up : label.style_label_down
 
-        sigStyle = isBuy ? label.style_label_up : label.style_label_down
-
-        // M4: 信号质量评分
-        int qualityScore = 0
-        if showSignalQualityInput
-            qualityScore := scoreSignal(sig.sType, sig.refIndex, sig.barIndex,
-              trendBeiChiSignals, zhongShuList, trendState)
-
-        // M4: MA 趋势过滤
-        bool maFiltered = false
-        if showMATrendFilterInput
-            if (isBuy and close <= maTrendValue) or (isSell and close >= maTrendValue)
-                maFiltered := true
-
-        // M4: 颜色覆盖（MA 过滤 → 整体变灰）
-        if maFiltered
-            sigColor := color.new(color.gray, 50)
-
-        // M4: 最低质量阈值 + MA 过滤守卫
-        bool shouldRender = true
-        if showSignalQualityInput and minSignalQualityInput > 0 and qualityScore < minSignalQualityInput
-            shouldRender := false
-
-        if shouldRender
-            // M3: 计算止损价
-            float slPrice = na
-            if showStopLossInput
-                refPrice = switch sig.sType
-                    SignalType.B2 =>
-                        float b1Price = na
-                        for fs in firstSignals
-                            if fs.sType == SignalType.B1 and fs.refIndex == sig.refIndex
-                                b1Price := fs.price
-                                break
-                        b1Price
-                    SignalType.S2 =>
-                        float s1Price = na
-                        for fs in firstSignals
-                            if fs.sType == SignalType.S1 and fs.refIndex == sig.refIndex
-                                s1Price := fs.price
-                                break
-                        s1Price
-                    => float(na)
-
-                zd = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).initialZD : na
-                zg = sig.refIndex < zhongShuList.size() ? zhongShuList.get(sig.refIndex).initialZG : na
-
-                slPrice := getStopLossForSignal(sig.sType, sig.price, refPrice, zd, zg, atrCurrent)
-
-            // M3+M4: 构建标签文字
-            sigTypeName = switch sig.sType
-                SignalType.B1 => "B1"
-                SignalType.B2 => "B2"
-                SignalType.B3 => "B3"
-                SignalType.S1 => "S1"
-                SignalType.S2 => "S2"
-                SignalType.S3 => "S3"
-
-            // 第一行：信号类型 [+ ★评分] [+ MA过滤标记]
-            string line1 = sigTypeName
+            // M4: 信号质量评分
+            int qualityScore = 0
             if showSignalQualityInput
-                line1 := str.format("★{0} {1}", qualityScore, sigTypeName)
+                signalTrendState = getTrendStateAt(strokes, 5, sig.barIndex)
+                qualityScore := scoreSignal(sig.sType, sig.refIndex, sig.barIndex,
+                  trendBeiChiSignals, zhongShuList, signalTrendState)
+
+            // M4: 按信号形成当时的 close/MA 过滤，不能用最后一根K线状态统一回评历史。
+            bool maFiltered = false
+            if showMATrendFilterInput and sig.barIndex >= 0 and sig.barIndex < closeValues.size() and sig.barIndex < maTrendValues.size()
+                signalClose = closeValues.get(sig.barIndex)
+                signalMA = maTrendValues.get(sig.barIndex)
+                if not na(signalMA) and ((isBuy and signalClose <= signalMA) or (isSell and signalClose >= signalMA))
+                    maFiltered := true
+
+            // M4: 颜色覆盖（MA 过滤 → 整体变灰）
             if maFiltered
-                line1 := str.format("{0} [MA过滤]", line1)
+                sigColor := color.new(color.gray, 50)
 
-            // 第二行：价格
-            string line2 = str.tostring(math.round_to_mintick(sig.price))
+            // M4: 最低质量阈值 + MA 过滤守卫
+            bool shouldRender = true
+            if showSignalQualityInput and minSignalQualityInput > 0 and qualityScore < minSignalQualityInput
+                shouldRender := false
 
-            // 组装
-            labelText = str.format("{0}\n{1}", line1, line2)
-            if showStopLossInput and not na(slPrice)
-                labelText := str.format("{0}\n止损 {1,number,#.##}", labelText, slPrice)
+            if shouldRender
+                // M3: 使用信号形成当时的 ATR/结构边界，而不是用当前最后一根K线的 ATR 回算历史。
+                float slPrice = na
+                if showStopLossInput
+                    slPrice := getStoredStopLoss(sig, firstSignals, zhongShuList, atrValues)
 
-            sigLabel = label.new(
-              sigTime,
-              sigPrice,
-              labelText,
-              color=sigColor,
-              textcolor=color.white,
-              style=sigStyle,
-              size=size.small,
-              xloc=xloc.bar_time
-            )
-            signalLabels.push(sigLabel)
+                // M3+M4: 构建标签文字
+                sigTypeName = switch sig.sType
+                    SignalType.B1 => "B1"
+                    SignalType.B2 => "B2"
+                    SignalType.B3 => "B3"
+                    SignalType.S1 => "S1"
+                    SignalType.S2 => "S2"
+                    SignalType.S3 => "S3"
+
+                // 第一行：信号类型 [+ ★评分] [+ MA过滤标记]
+                string line1 = sigTypeName
+                if showSignalQualityInput
+                    line1 := str.format("★{0} {1}", qualityScore, sigTypeName)
+                if maFiltered
+                    line1 := str.format("{0} [MA过滤]", line1)
+
+                // 第二行：价格
+                string line2 = str.tostring(math.round_to_mintick(sig.price))
+
+                // 组装
+                labelText = str.format("{0}\n{1}", line1, line2)
+                if showStopLossInput and not na(slPrice)
+                    labelText := str.format("{0}\n止损 {1,number,#.##}", labelText, slPrice)
+
+                sigLabel = label.new(
+                  sigTime,
+                  sigPrice,
+                  labelText,
+                  color=sigColor,
+                  textcolor=color.white,
+                  style=sigStyle,
+                  size=size.normal,
+                  xloc=xloc.bar_time
+                )
+                signalLabels.push(sigLabel)
+
+// --- 4d. 最近买点/卖点参考止损线 ---
+// 最多两条，分别对应最近一个买点和卖点；超过保留周期后自动隐藏，避免旧线被误当成当前仓位止损。
+var array<line>  latestStopLines  = array.new<line>()
+var array<label> latestStopLabels = array.new<label>()
+
+if needFullRebuild
+    for oldLine in latestStopLines
+        oldLine.delete()
+    latestStopLines.clear()
+    for oldLabel in latestStopLabels
+        oldLabel.delete()
+    latestStopLabels.clear()
+
+    if showStopLossInput and showLatestStopLinesInput
+        int latestBuyIdx = -1
+        int latestSellIdx = -1
+        int scanIdx = 0
+        for scanSig in allFilteredSignals
+            scanIsBuy = scanSig.sType == SignalType.B1 or scanSig.sType == SignalType.B2 or scanSig.sType == SignalType.B3
+            if scanIsBuy
+                latestBuyIdx := scanIdx
+            else
+                latestSellIdx := scanIdx
+            scanIdx += 1
+
+        if latestBuyIdx >= 0
+            buySig = allFilteredSignals.get(latestBuyIdx)
+            buyAge = bar_index - buySig.barIndex
+            buySl = getStoredStopLoss(buySig, firstSignals, zhongShuList, atrValues)
+            if buyAge <= latestStopMaxAgeInput and not na(buySl)
+                buyType = switch buySig.sType
+                    SignalType.B1 => "B1"
+                    SignalType.B2 => "B2"
+                    SignalType.B3 => "B3"
+                    => "B"
+                latestStopLines.push(line.new(
+                  barTimes.get(buySig.barIndex), buySl, time_close, buySl,
+                  xloc=xloc.bar_time, extend=extend.right,
+                  color=color.new(color.lime, 15), style=line.style_dashed, width=2
+                ))
+                latestStopLabels.push(label.new(
+                  time_close, buySl, str.format("最近{0}参考止损 {1,number,#.##}", buyType, buySl),
+                  xloc=xloc.bar_time, style=label.style_label_left,
+                  color=color.new(color.green, 15), textcolor=color.white, size=size.small
+                ))
+
+        if latestSellIdx >= 0
+            sellSig = allFilteredSignals.get(latestSellIdx)
+            sellAge = bar_index - sellSig.barIndex
+            sellSl = getStoredStopLoss(sellSig, firstSignals, zhongShuList, atrValues)
+            if sellAge <= latestStopMaxAgeInput and not na(sellSl)
+                sellType = switch sellSig.sType
+                    SignalType.S1 => "S1"
+                    SignalType.S2 => "S2"
+                    SignalType.S3 => "S3"
+                    => "S"
+                latestStopLines.push(line.new(
+                  barTimes.get(sellSig.barIndex), sellSl, time_close, sellSl,
+                  xloc=xloc.bar_time, extend=extend.right,
+                  color=color.new(color.red, 15), style=line.style_dashed, width=2
+                ))
+                latestStopLabels.push(label.new(
+                  time_close, sellSl, str.format("最近{0}参考止损 {1,number,#.##}", sellType, sellSl),
+                  xloc=xloc.bar_time, style=label.style_label_left,
+                  color=color.new(color.red, 15), textcolor=color.white, size=size.small
+                ))
 
 // 清理调试标签：每次 needFullRebuild 时清空旧标签。
 // 注意：清空后历史 bar 的调试标签不会自动重建（per-bar 逻辑只对当前 bar_index 生效），
@@ -1923,14 +2040,56 @@ if needFullRebuild
 
 // --- 预判计算（统一入口：实时 bar 首次 tick + 历史加载完成时各算一次，面板和告警复用）---
 if barstate.isrealtime or barstate.islastconfirmedhistory
-    // barstate.isnew：每个新 bar 首次执行为 true；barstate.islastconfirmedhistory：历史加载完成
-    // 缓存失效仅由这两个事件触发，删除了原来的 else 重置分支
-    if barstate.isnew or barstate.islastconfirmedhistory
+    // 新 bar 首 tick、历史加载完成、实时收盘全量重建时刷新；确保收盘后新确认信号立刻进入面板。
+    if barstate.isnew or barstate.islastconfirmedhistory or needFullRebuild
         predictionsCached := false
 
     if not predictionsCached
         cachedPredictions.clear()
         newPredictions = computePredictions(strokes, zhongShuList, trendBeiChiSignals, allFilteredSignals)
+
+        // 严格缠论结构暂时没有候选时，面板不能只剩空表头：回退显示最近确认的买点和卖点。
+        // “最近确认”是复盘信息，不代表当前再次触发；状态文字会明确区分。
+        if newPredictions.size() == 0
+            int fallbackBuyIdx = -1
+            int fallbackSellIdx = -1
+            int fallbackIdx = 0
+            for fallbackSig in allFilteredSignals
+                fallbackIsBuy = fallbackSig.sType == SignalType.B1 or fallbackSig.sType == SignalType.B2 or fallbackSig.sType == SignalType.B3
+                if fallbackIsBuy
+                    fallbackBuyIdx := fallbackIdx
+                else
+                    fallbackSellIdx := fallbackIdx
+                fallbackIdx += 1
+
+            if fallbackBuyIdx >= 0 and showBuySignalsInput
+                lastBuy = allFilteredSignals.get(fallbackBuyIdx)
+                lastBuyType = switch lastBuy.sType
+                    SignalType.B1 => "B1"
+                    SignalType.B2 => "B2"
+                    SignalType.B3 => "B3"
+                    => "B"
+                lastBuyAge = bar_index - lastBuy.barIndex
+                newPredictions.push(Prediction.new(
+                  lastBuyType, lastBuy.price,
+                  str.format("{0}根K前确认，仅供复盘", lastBuyAge), "UP", "ℹ 最近信号",
+                  getStoredStopLoss(lastBuy, firstSignals, zhongShuList, atrValues)
+                ))
+
+            if fallbackSellIdx >= 0 and showSellSignalsInput
+                lastSell = allFilteredSignals.get(fallbackSellIdx)
+                lastSellType = switch lastSell.sType
+                    SignalType.S1 => "S1"
+                    SignalType.S2 => "S2"
+                    SignalType.S3 => "S3"
+                    => "S"
+                lastSellAge = bar_index - lastSell.barIndex
+                newPredictions.push(Prediction.new(
+                  lastSellType, lastSell.price,
+                  str.format("{0}根K前确认，仅供复盘", lastSellAge), "DOWN", "ℹ 最近信号",
+                  getStoredStopLoss(lastSell, firstSignals, zhongShuList, atrValues)
+                ))
+
         for p in newPredictions
             cachedPredictions.push(p)
         predictionsCached := true
@@ -1983,15 +2142,10 @@ if showPanel
             table.cell(predictTable, 2, row + 1, priceText,
               text_color=color.white, bgcolor=rowColor)
 
-            // 列 3: 距离%（非交易时段显示 --）
-            string distText = ""
-            color  distColor = color.gray
-            if isNonTrading
-                distText := "--"
-            else
-                dist = (p.triggerPrice - currentPrice) / currentPrice * 100.0
-                distText := str.format("{0,number,#.#}%", dist)
-                distColor := dist > 0 ? color.green : color.red
+            // 列 3: 与触发价的绝对距离。收盘后仍可用收盘价计算，不再显示无信息量的“--”。
+            dist = math.abs(currentPrice - p.triggerPrice) / p.triggerPrice * 100.0
+            string distText = str.format("{0,number,#.#}%", dist)
+            color distColor = dist <= alertThresholdInput ? color.yellow : color.white
             table.cell(predictTable, 3, row + 1, distText,
               text_color=distColor, bgcolor=rowColor)
 
@@ -2004,7 +2158,8 @@ if showPanel
 
             // 列 5: 距止损%
             if showStopLossInput and not na(p.stopLoss)
-                slDist = (currentPrice - p.stopLoss) / currentPrice * 100.0
+                // 买点：现价高于止损为安全；卖点：现价低于止损为安全。统一正数=尚未触及。
+                slDist = isBuy ? (currentPrice - p.stopLoss) / currentPrice * 100.0 : (p.stopLoss - currentPrice) / currentPrice * 100.0
                 slDistText = str.format("{0,number,#.#}%", slDist)
                 slDistColor = slDist > 0 ? color.green : color.red
                 table.cell(predictTable, 5, row + 1, slDistText,
@@ -2023,6 +2178,12 @@ if showPanel
             for col = 0 to 6
                 table.cell(predictTable, col, row + 1, "", bgcolor=na)
 
+    if maxRows == 0
+        table.cell(predictTable, 0, 1, "暂无信号",
+          text_color=color.yellow, bgcolor=color.new(color.orange, 85))
+        table.cell(predictTable, 6, 1, "等待形成可用的笔/中枢结构",
+          text_color=color.white, bgcolor=color.new(color.orange, 85))
+
     // 更新时间戳行（row 7，永远填充，不需要清理）
     string timeText = str.format("更新: {0,time,HH:mm:ss}", timenow)
     if isNonTrading
@@ -2037,8 +2198,8 @@ if showPanel
 // alert.freq_once_per_bar_close 确保每根 bar 每种信号最多告警一次。
 if barstate.isrealtime
     for p in cachedPredictions
-        // 已触发的预判不再告警（信号标签已显示，无需重复提醒）
-        if p.statusText == "✅ 已触发"
+        // 已触发项和“最近信号”回退行都不是待触发候选，不发送接近价告警。
+        if p.statusText == "✅ 已触发" or p.statusText == "ℹ 最近信号"
             continue
 
         distPct = math.abs(close - p.triggerPrice) / p.triggerPrice * 100.0
@@ -2053,55 +2214,34 @@ if barstate.isrealtime
               alert.freq_once_per_bar_close
             )
 
-// --- 7. 分型标记 ---
-// 顶分型：红色▼三角 + "顶"文字标签，画在K线上方
-// 底分型：绿色▲三角 + "底"文字标签，画在K线下方
-// plotshape 提供轻量级三角标记，label.new 提供清晰的中文文字
-isTopFractal    = false
-isBottomFractal = false
+// --- 7. 新买卖点确认事件 ---
+// 缠论信号依赖后续K线确认分型，识别时 sig.barIndex 通常早于当前 bar_index，不能用
+// “sig.barIndex == bar_index”判断新信号。这里在历史加载完成时建立基线，之后每次
+// 实时收盘重建若出现更晚的信号，则在确认K线上给出 B/S 标记并开放 alertcondition。
+var int lastSeenSignalBar = -1
+bool newBuyConfirmed = false
+bool newSellConfirmed = false
 
-for f in fractals
-    if f.originalIndex == bar_index
-        isTopFractal    := f.fType == FractalType.TOP
-        isBottomFractal := f.fType == FractalType.BOTTOM
-        break
+if needFullRebuild
+    int newestSignalBar = lastSeenSignalBar
+    for confirmedSig in allFilteredSignals
+        if barstate.isrealtime and confirmedSig.barIndex > lastSeenSignalBar
+            confirmedIsBuy = confirmedSig.sType == SignalType.B1 or confirmedSig.sType == SignalType.B2 or confirmedSig.sType == SignalType.B3
+            if confirmedIsBuy and showBuySignalsInput
+                newBuyConfirmed := true
+            if not confirmedIsBuy and showSellSignalsInput
+                newSellConfirmed := true
+        newestSignalBar := math.max(newestSignalBar, confirmedSig.barIndex)
+    lastSeenSignalBar := newestSignalBar
 
-plotshape(isTopFractal, "顶分型", shape.triangledown, location.abovebar, color.new(color.red, 45), size=size.tiny, offset=0)
-plotshape(isBottomFractal, "底分型", shape.triangleup, location.belowbar, color.new(color.green, 45), size=size.tiny, offset=0)
+plotshape(newBuyConfirmed, "新买点确认", shape.labelup, location.belowbar,
+  color.new(color.lime, 0), text="B确认", textcolor=color.black, size=size.small)
+plotshape(newSellConfirmed, "新卖点确认", shape.labeldown, location.abovebar,
+  color.new(color.red, 0), text="S确认", textcolor=color.white, size=size.small)
 
-// --- 7b. 买卖点 plotshape 标记（不占用 label 配额）---
-// label.new 受 max_labels_count=500 硬上限约束，历史较长时最早的买卖点标签会被
-// TradingView 自动回收。plotshape 是声明式绘制，没有数量上限，因此这里为每个
-// 买卖点额外画一个 B/S 标记，保证任意缩放下买卖点都不会"消失"。
-// 位置：买点画在K线下方，卖点画在K线上方，与分型三角错开避免互相遮挡。
-bool sigBuyHere  = false
-bool sigSellHere = false
-string sigTextHere = ""
-
-for sig in allFilteredSignals
-    if sig.barIndex == bar_index
-        isB = sig.sType == SignalType.B1 or sig.sType == SignalType.B2 or sig.sType == SignalType.B3
-        isS = sig.sType == SignalType.S1 or sig.sType == SignalType.S2 or sig.sType == SignalType.S3
-        if (isB and showBuySignalsInput) or (isS and showSellSignalsInput)
-            sigBuyHere  := isB
-            sigSellHere := isS
-            sigTextHere := switch sig.sType
-                SignalType.B1 => "B1"
-                SignalType.B2 => "B2"
-                SignalType.B3 => "B3"
-                SignalType.S1 => "S1"
-                SignalType.S2 => "S2"
-                SignalType.S3 => "S3"
-            break
-
-plotshape(sigBuyHere,  "买点标记", shape.labelup,   location.belowbar,
-  color.new(color.lime, 0), text="B", textcolor=color.black, size=size.small, offset=0)
-plotshape(sigSellHere, "卖点标记", shape.labeldown, location.abovebar,
-  color.new(color.red, 0),  text="S", textcolor=color.white, size=size.small, offset=0)
-
-// 买卖点专用 alert 条件（可在 TradingView 告警面板直接选择）
-alertcondition(sigBuyHere,  "缠论买点触发", "缠论买点触发")
-alertcondition(sigSellHere, "缠论卖点触发", "缠论卖点触发")
+// 可在 TradingView 的“创建提醒”中直接选择这两个条件。
+alertcondition(newBuyConfirmed, "缠论买点确认", "缠论出现新的确认买点，请查看图上触发价与参考止损")
+alertcondition(newSellConfirmed, "缠论卖点确认", "缠论出现新的确认卖点，请查看图上触发价与参考止损")
 
 // --- 8. 调试模式：包含处理前后对比 ---
 // 关闭调试模式时，所有辅助元素隐藏，不影响正常看图
