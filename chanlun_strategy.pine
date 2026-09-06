@@ -1,0 +1,711 @@
+//@version=6
+// 缠论多周期共振策略 v0.1.0
+// 交易级别 B 入场，执行级别 S 提前退出；所有订单只使用实际确认事件，不在历史拐点回填成交。
+strategy("缠论多周期共振回测 [Chanlun MTF Strategy]", "缠论MTF策略",
+  overlay=true, pyramiding=0, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.1,
+  slippage=2, process_orders_on_close=true, calc_on_every_tick=false,
+  max_labels_count=200, max_lines_count=200)
+
+// ============================================================
+// 参数
+// ============================================================
+
+string GROUP_TF = "1. 多周期"
+string executionTfInput = input.timeframe("60", "执行周期（必须等于图表周期）", group=GROUP_TF,
+  tooltip="策略订单始终在图表K线上执行。要做 日线+60分钟，请把图表设为60分钟，并在这里选择60")
+string tradeTfInput = input.timeframe("D", "交易级别", group=GROUP_TF,
+  tooltip="高级别严格缠论 B 用于入场，高级别反向信号也可退出。必须大于执行周期")
+bool requireLtfEntryInput = input.bool(false, "入场还要求执行周期同向B/S", group=GROUP_TF,
+  tooltip="关闭=交易级别B/S直接入场；开启=交易级别信号出现后，等待执行周期同向信号确认")
+int resonanceWindowInput = input.int(48, "低级别共振等待K线", minval=1, maxval=500, group=GROUP_TF,
+  tooltip="开启低级别入场确认后，高级别信号最多等待多少根执行周期K线")
+bool exitOnLtfOppositeInput = input.bool(true, "执行周期反向信号提前退出", group=GROUP_TF)
+bool exitOnHtfOppositeInput = input.bool(true, "交易级别反向信号退出", group=GROUP_TF)
+
+string GROUP_DIR = "2. 交易方向"
+string directionInput = input.string("只做多", "方向", options=["只做多", "只做空", "多空双向"], group=GROUP_DIR)
+bool enableB1Input = input.bool(true, "使用 B1/S1", group=GROUP_DIR)
+bool enableB2Input = input.bool(true, "使用 B2/S2", group=GROUP_DIR)
+bool enableB3Input = input.bool(true, "使用 B3/S3", group=GROUP_DIR)
+
+string GROUP_CORE = "3. 严格缠论参数"
+int minBarsForBiInput = input.int(5, "笔最少合并后K线数", minval=2, maxval=10, group=GROUP_CORE)
+float minBiPriceChangeInput = input.float(0.0, "笔最小价格变化 (%)", minval=0.0, maxval=20.0, step=0.1, group=GROUP_CORE)
+int minStrokesForZSInput = input.int(3, "中枢最少笔数", minval=3, maxval=10, group=GROUP_CORE)
+float minZSWidthInput = input.float(0.0, "中枢最小宽度 (%)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_CORE)
+int macdFastInput = input.int(12, "MACD快线", minval=2, maxval=50, group=GROUP_CORE)
+int macdSlowInput = input.int(26, "MACD慢线", minval=5, maxval=100, group=GROUP_CORE)
+int macdSignalInput = input.int(9, "MACD信号线", minval=2, maxval=50, group=GROUP_CORE)
+bool macdAbsoluteInput = input.bool(false, "MACD绝对值面积", group=GROUP_CORE)
+float areaRatioThresholdInput = input.float(0.8, "背驰面积比阈值", minval=0.1, maxval=1.0, step=0.05, group=GROUP_CORE)
+int minSignalBarsInput = input.int(10, "同类型信号最小间距", minval=1, maxval=500, group=GROUP_CORE)
+
+string GROUP_RISK = "4. 风控与仓位"
+float riskPctInput = input.float(1.0, "单笔风险占权益 (%)", minval=0.1, maxval=10.0, step=0.1, group=GROUP_RISK,
+  tooltip="按入场价到初始止损的距离反推数量；仍受最大名义仓位限制")
+float maxExposurePctInput = input.float(100.0, "最大名义仓位占权益 (%)", minval=1.0, maxval=500.0, step=5.0, group=GROUP_RISK)
+int atrPeriodInput = input.int(14, "ATR周期", minval=5, maxval=100, group=GROUP_RISK)
+float initialAtrMultInput = input.float(1.5, "无结构止损时ATR倍数", minval=0.5, maxval=10.0, step=0.1, group=GROUP_RISK)
+bool trailingStopInput = input.bool(true, "启用ATR移动止损", group=GROUP_RISK)
+float trailAtrMultInput = input.float(3.0, "移动止损ATR倍数", minval=0.5, maxval=15.0, step=0.1, group=GROUP_RISK)
+float trailActivationAtrInput = input.float(1.0, "浮盈达到ATR倍数后启动移动止损", minval=0.0, maxval=10.0, step=0.25, group=GROUP_RISK)
+bool maxHoldingExitInput = input.bool(true, "启用最大持仓时间退出", group=GROUP_RISK)
+int maxHoldingBarsInput = input.int(240, "最大持仓执行周期K线数", minval=1, maxval=10000, group=GROUP_RISK)
+
+string GROUP_TEST = "5. 回测区间"
+int startTimeInput = input.time(timestamp(2022, 1, 1, 0, 0), "开始时间", group=GROUP_TEST)
+int endTimeInput = input.time(timestamp(2030, 12, 31, 23, 59), "结束时间", group=GROUP_TEST)
+bool closeAtEndInput = input.bool(true, "回测结束强制平仓", group=GROUP_TEST)
+
+// ============================================================
+// 严格核心数据结构
+// ============================================================
+
+enum TrendDirection
+    UP
+    DOWN
+
+enum FractalType
+    TOP
+    BOTTOM
+
+enum StrokeDirection
+    UP
+    DOWN
+
+type MergedBar
+    int originalIndex
+    int mergedCount
+    float high
+    float low
+    float open
+    float close
+    TrendDirection direction
+
+type Fractal
+    int barIndex
+    int originalIndex
+    float price
+    FractalType fType
+
+type Stroke
+    int startOrigIndex
+    int endOrigIndex
+    float startPrice
+    float endPrice
+    StrokeDirection dir
+    int barCount
+    float priceChange
+    float priceChangePct
+
+type ZhongShu
+    int startStrokeIdx
+    int endStrokeIdx
+    int startOrigIndex
+    int endOrigIndex
+    float zg
+    float zd
+    float gg
+    float dd
+    int strokeCount
+    StrokeDirection startDir
+    float initialZG
+    float initialZD
+
+// ============================================================
+// 严格核心：包含、分型、笔、中枢
+// ============================================================
+
+f_hasContainment(bar1, bar2) =>
+    (bar1.high >= bar2.high and bar1.low <= bar2.low) or (bar2.high >= bar1.high and bar2.low <= bar1.low)
+
+f_trendDirection(prevBar, currBar) =>
+    if prevBar.low < currBar.low
+        TrendDirection.UP
+    else if prevBar.high > currBar.high
+        TrendDirection.DOWN
+    else
+        TrendDirection.UP
+
+f_mergeBars(bar1, bar2, direction) =>
+    mergedHigh = direction == TrendDirection.UP ? math.max(bar1.high, bar2.high) : math.min(bar1.high, bar2.high)
+    mergedLow = direction == TrendDirection.UP ? math.max(bar1.low, bar2.low) : math.min(bar1.low, bar2.low)
+    MergedBar.new(bar1.originalIndex, bar1.mergedCount + bar2.mergedCount,
+      mergedHigh, mergedLow, bar1.open, bar2.close, direction)
+
+f_buildStrokes(rawFractals, minMergedBars, minPriceChangePct) =>
+    result = array.new<Stroke>()
+    n = rawFractals.size()
+    int startIdx = 0
+    while startIdx < n - 1
+        bestStart = rawFractals.get(startIdx)
+        int j = startIdx + 1
+        while j < n
+            currF = rawFractals.get(j)
+            if currF.fType == bestStart.fType
+                moreExtreme = (currF.fType == FractalType.TOP and currF.price > bestStart.price) or
+                  (currF.fType == FractalType.BOTTOM and currF.price < bestStart.price)
+                if moreExtreme
+                    bestStart := currF
+                j += 1
+            else
+                break
+        if j >= n
+            break
+
+        int bestEndIdx = -1
+        float bestScore = -1e18
+        int k = j
+        while k < n
+            kF = rawFractals.get(k)
+            if kF.fType == bestStart.fType
+                break
+            kGap = kF.barIndex - bestStart.barIndex + 1
+            kChgPct = math.abs(kF.price - bestStart.price) / bestStart.price * 100.0
+            valid = kGap >= minMergedBars and (minPriceChangePct <= 0 or kChgPct >= minPriceChangePct)
+            if valid and kChgPct > bestScore
+                bestScore := kChgPct
+                bestEndIdx := k
+            k += 1
+
+        if bestEndIdx < 0
+            if result.size() > 0
+                targetType = result.last().dir == StrokeDirection.UP ? FractalType.TOP : FractalType.BOTTOM
+                startIdx += 1
+                while startIdx < n and rawFractals.get(startIdx).fType != targetType
+                    startIdx += 1
+            else
+                startIdx += 1
+            continue
+
+        bestEnd = rawFractals.get(bestEndIdx)
+        rawGap = bestEnd.originalIndex - bestStart.originalIndex + 1
+        direction = bestStart.fType == FractalType.BOTTOM ? StrokeDirection.UP : StrokeDirection.DOWN
+        change = math.abs(bestEnd.price - bestStart.price)
+        changePct = change / bestStart.price * 100.0
+        result.push(Stroke.new(bestStart.originalIndex, bestEnd.originalIndex,
+          bestStart.price, bestEnd.price, direction, rawGap, change, changePct))
+        startIdx := bestEndIdx
+    result
+
+f_strokeRange(s) =>
+    if s.dir == StrokeDirection.UP
+        [s.startPrice, s.endPrice]
+    else
+        [s.endPrice, s.startPrice]
+
+f_identifyZhongShu(strokes) =>
+    result = array.new<ZhongShu>()
+    n = strokes.size()
+    int i = 0
+    while i <= n - minStrokesForZSInput
+        s0 = strokes.get(i)
+        s1 = strokes.get(i + 1)
+        s2 = strokes.get(i + 2)
+        [s0Low, s0High] = f_strokeRange(s0)
+        [s1Low, s1High] = f_strokeRange(s1)
+        [s2Low, s2High] = f_strokeRange(s2)
+        zg = math.min(s0High, s1High, s2High)
+        zd = math.max(s0Low, s1Low, s2Low)
+        gg = math.max(s0High, s1High, s2High)
+        dd = math.min(s0Low, s1Low, s2Low)
+        if zg > zd
+            center = (zg + zd) / 2.0
+            widthPct = (zg - zd) / center * 100.0
+            if minZSWidthInput > 0 and widthPct < minZSWidthInput
+                i += 1
+                continue
+            initialZG = zg
+            initialZD = zd
+            int endIdx = i + 2
+            int j = i + 3
+            while j < n
+                sj = strokes.get(j)
+                [sjLow, sjHigh] = f_strokeRange(sj)
+                newZg = math.min(zg, sjHigh)
+                newZd = math.max(zd, sjLow)
+                if newZg > newZd
+                    zg := newZg
+                    zd := newZd
+                    gg := math.max(gg, sjHigh)
+                    dd := math.min(dd, sjLow)
+                    endIdx := j
+                    j += 1
+                else
+                    break
+            strokeCount = endIdx - i + 1
+            if strokeCount >= minStrokesForZSInput
+                startStroke = strokes.get(i)
+                endStroke = strokes.get(endIdx)
+                result.push(ZhongShu.new(i, endIdx,
+                  startStroke.startOrigIndex, endStroke.endOrigIndex,
+                  zg, zd, gg, dd, strokeCount, startStroke.dir, initialZG, initialZD))
+            i := endIdx + 1
+        else
+            i += 1
+    result
+
+f_macdArea(s, histValues) =>
+    float area = 0.0
+    startIdx = math.max(0, s.startOrigIndex)
+    endIdx = math.min(s.endOrigIndex, histValues.size() - 1)
+    if startIdx <= endIdx
+        for i = startIdx to endIdx
+            value = histValues.get(i)
+            area += macdAbsoluteInput ? math.abs(value) : value
+    area
+
+f_strokeInZhongShu(strokeIdx, zhongShuList) =>
+    bool inside = false
+    for zs in zhongShuList
+        if strokeIdx >= zs.startStrokeIdx and strokeIdx <= zs.endStrokeIdx
+            inside := true
+            break
+    inside
+
+f_hasSeparatingZhongShu(aIdx, bIdx, zhongShuList) =>
+    bool found = false
+    for zs in zhongShuList
+        if zs.startStrokeIdx > aIdx and zs.endStrokeIdx < bIdx
+            found := true
+            break
+    found
+
+// 返回 1=底背驰(B1原始条件)，-1=顶背驰(S1原始条件)，0=无。
+f_latestTrendDivergence(strokes, zhongShuList, histValues, bIdx) =>
+    int result = 0
+    if bIdx > 0 and not f_strokeInZhongShu(bIdx, zhongShuList)
+        b = strokes.get(bIdx)
+        areaB = f_macdArea(b, histValues)
+        for aIdx = 0 to bIdx - 1
+            a = strokes.get(aIdx)
+            if a.dir == b.dir and not f_strokeInZhongShu(aIdx, zhongShuList) and
+               f_hasSeparatingZhongShu(aIdx, bIdx, zhongShuList)
+                areaA = f_macdArea(a, histValues)
+                ratio = areaA != 0 ? areaB / areaA : 999.0
+                topBc = b.dir == StrokeDirection.UP and b.endPrice > a.endPrice and ratio < areaRatioThresholdInput
+                bottomBc = b.dir == StrokeDirection.DOWN and b.endPrice < a.endPrice and ratio < areaRatioThresholdInput
+                if topBc
+                    result := -1
+                if bottomBc
+                    result := 1
+    result
+
+f_acceptSignal(lastBars, typeIdx, signalBar) =>
+    accepted = signalBar - lastBars.get(typeIdx) >= minSignalBarsInput
+    if accepted
+        lastBars.set(typeIdx, signalBar)
+    accepted
+
+f_at(values, idx, fallback) =>
+    idx >= 0 and idx < values.size() and not na(values.get(idx)) ? values.get(idx) : fallback
+
+// ============================================================
+// 因果确认引擎
+// ============================================================
+// 与指标使用相同的包含、分型、两阶段笔、中枢、趋势背驰及三类点定义。
+// 为避免回填成交，只有候选笔不再是最后一根可变笔时才加入 confirmedStrokes。
+// 这会比指标画在理论拐点上的标签晚若干K线，但这是可交易回测必须付出的确认延迟。
+
+f_strictEngine() =>
+    [_, _, macdHist] = ta.macd(close, macdFastInput, macdSlowInput, macdSignalInput)
+    atrValue = ta.atr(atrPeriodInput)
+
+    var mergedBars = array.new<MergedBar>()
+    var rawFractals = array.new<Fractal>()
+    var confirmedStrokes = array.new<Stroke>()
+    var histValues = array.new<float>()
+    var atrValues = array.new<float>()
+    var lastSignalBars = array.new<int>(6, -1000000)
+
+    var b1StrokeRefs = array.new<int>()
+    var b1Prices = array.new<float>()
+    var b1Done = array.new<bool>()
+    var s1StrokeRefs = array.new<int>()
+    var s1Prices = array.new<float>()
+    var s1Done = array.new<bool>()
+
+    var int lastProcessedTime = na
+    var int lastEvaluatedMiddleOrig = -1
+    var int buySequence = 0
+    var int sellSequence = 0
+    var int lastEventCode = 0
+    var float lastEventPrice = na
+    var float lastEventStop = na
+    var int lastEventTime = na
+
+    closedContextBar = not barstate.isrealtime or time_close <= timenow
+    newClosedBar = closedContextBar and (na(lastProcessedTime) or time != lastProcessedTime)
+
+    if newClosedBar
+        lastProcessedTime := time
+        histValues.push(macdHist)
+        atrValues.push(atrValue)
+
+        oldMergedSize = mergedBars.size()
+        mergedBars.push(MergedBar.new(bar_index, 1, high, low, open, close, TrendDirection.UP))
+        if mergedBars.size() >= 2
+            int mergeIdx = mergedBars.size() - 1
+            while mergeIdx >= 1
+                prev = mergedBars.get(mergeIdx - 1)
+                curr = mergedBars.get(mergeIdx)
+                if f_hasContainment(prev, curr)
+                    direction = TrendDirection.UP
+                    if mergeIdx >= 2
+                        direction := f_trendDirection(mergedBars.get(mergeIdx - 2), prev)
+                    mergedBars.set(mergeIdx - 1, f_mergeBars(prev, curr, direction))
+                    mergedBars.remove(mergeIdx)
+                    mergeIdx -= 1
+                else
+                    break
+
+        // 仅在出现新的非包含K线时，确认它左侧已经稳定的三K分型。
+        if mergedBars.size() > oldMergedSize and mergedBars.size() >= 4
+            middleIdx = mergedBars.size() - 3
+            leftBar = mergedBars.get(middleIdx - 1)
+            middleBar = mergedBars.get(middleIdx)
+            rightBar = mergedBars.get(middleIdx + 1)
+            if middleBar.originalIndex > lastEvaluatedMiddleOrig
+                lastEvaluatedMiddleOrig := middleBar.originalIndex
+                topFractal = middleBar.high > leftBar.high and middleBar.high > rightBar.high and
+                  middleBar.low > leftBar.low and middleBar.low > rightBar.low
+                bottomFractal = middleBar.low < leftBar.low and middleBar.low < rightBar.low and
+                  middleBar.high < leftBar.high and middleBar.high < rightBar.high
+                if topFractal
+                    rawFractals.push(Fractal.new(middleIdx, middleBar.originalIndex, middleBar.high, FractalType.TOP))
+                if bottomFractal
+                    rawFractals.push(Fractal.new(middleIdx, middleBar.originalIndex, middleBar.low, FractalType.BOTTOM))
+
+                if topFractal or bottomFractal
+                    rebuiltStrokes = f_buildStrokes(rawFractals, minBarsForBiInput, minBiPriceChangeInput)
+                    // 最后一笔仍可能被后续同向分型替换；不允许它进入交易事件。
+                    stableStrokeCount = math.max(0, rebuiltStrokes.size() - 1)
+                    while confirmedStrokes.size() < stableStrokeCount
+                        nextStrokeIdx = confirmedStrokes.size()
+                        nextStroke = rebuiltStrokes.get(nextStrokeIdx)
+                        confirmedStrokes.push(nextStroke)
+                        currentIdx = confirmedStrokes.size() - 1
+                        zhongShuList = f_identifyZhongShu(confirmedStrokes)
+                        divergence = f_latestTrendDivergence(confirmedStrokes, zhongShuList, histValues, currentIdx)
+                        signalAtr = f_at(atrValues, nextStroke.endOrigIndex, atrValue)
+
+                        bool rawB1 = divergence == 1
+                        bool rawS1 = divergence == -1
+                        bool rawB2 = false
+                        bool rawS2 = false
+                        bool rawB3 = false
+                        bool rawS3 = false
+                        float b2Stop = na
+                        float s2Stop = na
+                        float b3Stop = na
+                        float s3Stop = na
+
+                        // 未经过间距过滤的一买/一卖也要进入二买/二卖前置集合，与指标口径一致。
+                        if rawB1
+                            b1StrokeRefs.push(currentIdx)
+                            b1Prices.push(nextStroke.endPrice)
+                            b1Done.push(false)
+                        if rawS1
+                            s1StrokeRefs.push(currentIdx)
+                            s1Prices.push(nextStroke.endPrice)
+                            s1Done.push(false)
+
+                        // B2：任一尚未完成的B1之后，出现 UP + DOWN，且回踩终点不破B1。
+                        if nextStroke.dir == StrokeDirection.DOWN and b1StrokeRefs.size() > 0 and currentIdx > 0
+                            for p = 0 to b1StrokeRefs.size() - 1
+                                if not b1Done.get(p)
+                                    refIdx = b1StrokeRefs.get(p)
+                                    refPrice = b1Prices.get(p)
+                                    priorStroke = confirmedStrokes.get(currentIdx - 1)
+                                    if currentIdx - 1 >= refIdx + 1 and priorStroke.dir == StrokeDirection.UP and nextStroke.endPrice > refPrice
+                                        rawB2 := true
+                                        b2Stop := refPrice
+                                        b1Done.set(p, true)
+                                        break
+
+                        // S2：任一尚未完成的S1之后，出现 DOWN + UP，且反弹终点不破S1。
+                        if nextStroke.dir == StrokeDirection.UP and s1StrokeRefs.size() > 0 and currentIdx > 0
+                            for p = 0 to s1StrokeRefs.size() - 1
+                                if not s1Done.get(p)
+                                    refIdx = s1StrokeRefs.get(p)
+                                    refPrice = s1Prices.get(p)
+                                    priorStroke = confirmedStrokes.get(currentIdx - 1)
+                                    if currentIdx - 1 >= refIdx + 1 and priorStroke.dir == StrokeDirection.DOWN and nextStroke.endPrice < refPrice
+                                        rawS2 := true
+                                        s2Stop := refPrice
+                                        s1Done.set(p, true)
+                                        break
+
+                        // B3/S3：中枢后离开笔 + 回抽笔刚刚确认。
+                        for zs in zhongShuList
+                            if currentIdx == zs.endStrokeIdx + 2
+                                leaveStroke = confirmedStrokes.get(zs.endStrokeIdx + 1)
+                                [pullbackLow, pullbackHigh] = f_strokeRange(nextStroke)
+                                if leaveStroke.dir == StrokeDirection.UP and nextStroke.dir == StrokeDirection.DOWN and pullbackLow > zs.initialZG
+                                    rawB3 := true
+                                    b3Stop := zs.initialZD
+                                if leaveStroke.dir == StrokeDirection.DOWN and nextStroke.dir == StrokeDirection.UP and pullbackHigh < zs.initialZD
+                                    rawS3 := true
+                                    s3Stop := zs.initialZG
+
+                        signalBar = nextStroke.endOrigIndex
+                        if rawB1 and f_acceptSignal(lastSignalBars, 0, signalBar)
+                            buySequence += 1
+                            lastEventCode := 1
+                            lastEventPrice := nextStroke.endPrice
+                            lastEventStop := nextStroke.endPrice - math.max(signalAtr * initialAtrMultInput, nextStroke.endPrice * 0.02)
+                            lastEventTime := time
+                        if rawB2 and f_acceptSignal(lastSignalBars, 1, signalBar)
+                            buySequence += 1
+                            lastEventCode := 2
+                            lastEventPrice := nextStroke.endPrice
+                            lastEventStop := b2Stop
+                            lastEventTime := time
+                        if rawB3 and f_acceptSignal(lastSignalBars, 2, signalBar)
+                            buySequence += 1
+                            lastEventCode := 3
+                            lastEventPrice := nextStroke.endPrice
+                            lastEventStop := b3Stop
+                            lastEventTime := time
+                        if rawS1 and f_acceptSignal(lastSignalBars, 3, signalBar)
+                            sellSequence += 1
+                            lastEventCode := -1
+                            lastEventPrice := nextStroke.endPrice
+                            lastEventStop := nextStroke.endPrice + math.max(signalAtr * initialAtrMultInput, nextStroke.endPrice * 0.02)
+                            lastEventTime := time
+                        if rawS2 and f_acceptSignal(lastSignalBars, 4, signalBar)
+                            sellSequence += 1
+                            lastEventCode := -2
+                            lastEventPrice := nextStroke.endPrice
+                            lastEventStop := s2Stop
+                            lastEventTime := time
+                        if rawS3 and f_acceptSignal(lastSignalBars, 5, signalBar)
+                            sellSequence += 1
+                            lastEventCode := -3
+                            lastEventPrice := nextStroke.endPrice
+                            lastEventStop := s3Stop
+                            lastEventTime := time
+
+    [buySequence, sellSequence, lastEventCode, lastEventPrice, lastEventStop, lastEventTime]
+
+// ============================================================
+// 多周期事件
+// ============================================================
+
+[ltfBuySeq, ltfSellSeq, ltfEventCode, _, _, _] = f_strictEngine()
+[htfBuySeq, htfSellSeq, htfEventCode, _, htfEventStop, _] = request.security(
+  syminfo.tickerid, tradeTfInput, f_strictEngine(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+newLtfBuy = ltfBuySeq > nz(ltfBuySeq[1], ltfBuySeq)
+newLtfSell = ltfSellSeq > nz(ltfSellSeq[1], ltfSellSeq)
+newHtfBuy = htfBuySeq > nz(htfBuySeq[1], htfBuySeq)
+newHtfSell = htfSellSeq > nz(htfSellSeq[1], htfSellSeq)
+
+f_typeEnabled(code) =>
+    magnitude = math.abs(code)
+    (magnitude == 1 and enableB1Input) or (magnitude == 2 and enableB2Input) or (magnitude == 3 and enableB3Input)
+
+f_signalName(code) =>
+    switch code
+        1 => "B1"
+        2 => "B2"
+        3 => "B3"
+        -1 => "S1"
+        -2 => "S2"
+        -3 => "S3"
+        => "--"
+
+chartSeconds = timeframe.in_seconds()
+executionSeconds = timeframe.in_seconds(executionTfInput)
+tradeSeconds = timeframe.in_seconds(tradeTfInput)
+timeframeMatches = chartSeconds == executionSeconds
+validHierarchy = tradeSeconds > executionSeconds
+configurationValid = timeframeMatches and validHierarchy
+inBacktestWindow = time >= startTimeInput and time <= endTimeInput
+allowLong = directionInput == "只做多" or directionInput == "多空双向"
+allowShort = directionInput == "只做空" or directionInput == "多空双向"
+
+// 可选共振等待：高级别信号打开窗口，执行级别同向信号完成入场。
+var int pendingLongUntil = na
+var int pendingShortUntil = na
+var int pendingLongCode = 0
+var int pendingShortCode = 0
+var float pendingLongStop = na
+var float pendingShortStop = na
+if newHtfBuy and f_typeEnabled(htfEventCode)
+    pendingLongUntil := bar_index + resonanceWindowInput
+    pendingLongCode := htfEventCode
+    pendingLongStop := htfEventStop
+if newHtfSell and f_typeEnabled(htfEventCode)
+    pendingShortUntil := bar_index + resonanceWindowInput
+    pendingShortCode := htfEventCode
+    pendingShortStop := htfEventStop
+
+longEntryEvent = newHtfBuy and f_typeEnabled(htfEventCode)
+shortEntryEvent = newHtfSell and f_typeEnabled(htfEventCode)
+if requireLtfEntryInput
+    longEntryEvent := not na(pendingLongUntil) and bar_index <= pendingLongUntil and newLtfBuy and f_typeEnabled(ltfEventCode)
+    shortEntryEvent := not na(pendingShortUntil) and bar_index <= pendingShortUntil and newLtfSell and f_typeEnabled(ltfEventCode)
+
+if not na(pendingLongUntil) and bar_index > pendingLongUntil
+    pendingLongUntil := na
+    pendingLongCode := 0
+    pendingLongStop := na
+if not na(pendingShortUntil) and bar_index > pendingShortUntil
+    pendingShortUntil := na
+    pendingShortCode := 0
+    pendingShortStop := na
+
+// ============================================================
+// 仓位和完整退出链
+// ============================================================
+
+atrExecution = ta.atr(atrPeriodInput)
+pointValue = math.max(syminfo.pointvalue, 1e-9)
+
+f_positionQty(entryPrice, stopPrice) =>
+    riskDistance = math.abs(entryPrice - stopPrice)
+    riskCash = strategy.equity * riskPctInput / 100.0
+    qtyByRisk = riskDistance > syminfo.mintick ? riskCash / (riskDistance * pointValue) : 0.0
+    qtyByExposure = strategy.equity * maxExposurePctInput / 100.0 / (entryPrice * pointValue)
+    math.max(0.0, math.min(qtyByRisk, qtyByExposure))
+
+var float longInitialStop = na
+var float shortInitialStop = na
+var float highSinceEntry = na
+var float lowSinceEntry = na
+var float activeLongStop = na
+var float activeShortStop = na
+var int entryBarIndex = na
+var string lastExitReason = "--"
+
+// 高级别B/S负责开仓。若结构止损位在入场价错误一侧，则回退到执行周期ATR止损。
+if configurationValid and inBacktestWindow
+    if longEntryEvent and allowLong and strategy.position_size <= 0
+        entryCode = requireLtfEntryInput ? pendingLongCode : htfEventCode
+        candidateStop = requireLtfEntryInput ? pendingLongStop : htfEventStop
+        if na(candidateStop) or candidateStop >= close
+            candidateStop := close - atrExecution * initialAtrMultInput
+        qty = f_positionQty(close, candidateStop)
+        if qty > 0
+            strategy.entry("Long", strategy.long, qty=qty, comment=f_signalName(entryCode))
+            longInitialStop := candidateStop
+            highSinceEntry := high
+            activeLongStop := candidateStop
+            entryBarIndex := bar_index
+            pendingLongUntil := na
+            pendingLongCode := 0
+            pendingLongStop := na
+
+    if shortEntryEvent and allowShort and strategy.position_size >= 0
+        entryCode = requireLtfEntryInput ? pendingShortCode : htfEventCode
+        candidateStop = requireLtfEntryInput ? pendingShortStop : htfEventStop
+        if na(candidateStop) or candidateStop <= close
+            candidateStop := close + atrExecution * initialAtrMultInput
+        qty = f_positionQty(close, candidateStop)
+        if qty > 0
+            strategy.entry("Short", strategy.short, qty=qty, comment=f_signalName(entryCode))
+            shortInitialStop := candidateStop
+            lowSinceEntry := low
+            activeShortStop := candidateStop
+            entryBarIndex := bar_index
+            pendingShortUntil := na
+            pendingShortCode := 0
+            pendingShortStop := na
+
+if strategy.position_size > 0
+    highSinceEntry := na(highSinceEntry) ? high : math.max(highSinceEntry, high)
+    activeLongStop := longInitialStop
+    trailActivated = trailingStopInput and highSinceEntry - strategy.position_avg_price >= atrExecution * trailActivationAtrInput
+    if trailActivated
+        activeLongStop := math.max(activeLongStop, highSinceEntry - atrExecution * trailAtrMultInput)
+    strategy.exit("L-Risk", "Long", stop=activeLongStop, comment="结构/ATR止损")
+
+    reversingToShort = shortEntryEvent and allowShort
+    if exitOnLtfOppositeInput and newLtfSell and f_typeEnabled(ltfEventCode) and not reversingToShort
+        lastExitReason := "执行周期" + f_signalName(ltfEventCode)
+        strategy.close("Long", comment=lastExitReason)
+    else if exitOnHtfOppositeInput and newHtfSell and f_typeEnabled(htfEventCode) and not reversingToShort
+        lastExitReason := "交易级别" + f_signalName(htfEventCode)
+        strategy.close("Long", comment=lastExitReason)
+    else if maxHoldingExitInput and not na(entryBarIndex) and bar_index - entryBarIndex >= maxHoldingBarsInput
+        lastExitReason := "最大持仓时间"
+        strategy.close("Long", comment=lastExitReason)
+
+if strategy.position_size < 0
+    lowSinceEntry := na(lowSinceEntry) ? low : math.min(lowSinceEntry, low)
+    activeShortStop := shortInitialStop
+    trailActivated = trailingStopInput and strategy.position_avg_price - lowSinceEntry >= atrExecution * trailActivationAtrInput
+    if trailActivated
+        activeShortStop := math.min(activeShortStop, lowSinceEntry + atrExecution * trailAtrMultInput)
+    strategy.exit("S-Risk", "Short", stop=activeShortStop, comment="结构/ATR止损")
+
+    reversingToLong = longEntryEvent and allowLong
+    if exitOnLtfOppositeInput and newLtfBuy and f_typeEnabled(ltfEventCode) and not reversingToLong
+        lastExitReason := "执行周期" + f_signalName(ltfEventCode)
+        strategy.close("Short", comment=lastExitReason)
+    else if exitOnHtfOppositeInput and newHtfBuy and f_typeEnabled(htfEventCode) and not reversingToLong
+        lastExitReason := "交易级别" + f_signalName(htfEventCode)
+        strategy.close("Short", comment=lastExitReason)
+    else if maxHoldingExitInput and not na(entryBarIndex) and bar_index - entryBarIndex >= maxHoldingBarsInput
+        lastExitReason := "最大持仓时间"
+        strategy.close("Short", comment=lastExitReason)
+
+// 仓位刚刚平掉后清理状态。
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    longInitialStop := na
+    shortInitialStop := na
+    highSinceEntry := na
+    lowSinceEntry := na
+    activeLongStop := na
+    activeShortStop := na
+    entryBarIndex := na
+
+if closeAtEndInput and time >= endTimeInput and strategy.position_size != 0
+    lastExitReason := "回测结束"
+    strategy.close_all(comment=lastExitReason)
+
+// ============================================================
+// 可视化、状态面板、提醒
+// ============================================================
+
+plot(strategy.position_size > 0 ? activeLongStop : na, "多头活动止损", color=color.lime, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? activeShortStop : na, "空头活动止损", color=color.red, linewidth=2, style=plot.style_linebr)
+
+plotshape(newHtfBuy and f_typeEnabled(htfEventCode), "交易级别B确认", shape.labelup, location.belowbar,
+  color=color.new(color.green, 0), text="HTF B", textcolor=color.white, size=size.small)
+plotshape(newHtfSell and f_typeEnabled(htfEventCode), "交易级别S确认", shape.labeldown, location.abovebar,
+  color=color.new(color.red, 0), text="HTF S", textcolor=color.white, size=size.small)
+plotshape(newLtfBuy and f_typeEnabled(ltfEventCode), "执行周期B确认", shape.triangleup, location.belowbar,
+  color=color.new(color.lime, 0), text="LTF B", textcolor=color.black, size=size.tiny)
+plotshape(newLtfSell and f_typeEnabled(ltfEventCode), "执行周期S确认", shape.triangledown, location.abovebar,
+  color=color.new(color.orange, 0), text="LTF S", textcolor=color.white, size=size.tiny)
+
+bgcolor(not configurationValid ? color.new(color.orange, 82) : na, title="周期配置错误")
+
+var table statusTable = table.new(position.top_right, 2, 8, border_width=1)
+if barstate.islast
+    table.cell(statusTable, 0, 0, "缠论MTF策略", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTable, 1, 0, configurationValid ? "配置正常" : "⚠ 周期错误",
+      text_color=color.white, bgcolor=configurationValid ? color.new(color.green, 30) : color.new(color.red, 20))
+    table.cell(statusTable, 0, 1, "图表/执行周期")
+    table.cell(statusTable, 1, 1, timeframe.period + " / " + executionTfInput)
+    table.cell(statusTable, 0, 2, "交易级别")
+    table.cell(statusTable, 1, 2, tradeTfInput)
+    table.cell(statusTable, 0, 3, "最近高级别")
+    table.cell(statusTable, 1, 3, f_signalName(htfEventCode))
+    table.cell(statusTable, 0, 4, "最近执行级别")
+    table.cell(statusTable, 1, 4, f_signalName(ltfEventCode))
+    table.cell(statusTable, 0, 5, "当前仓位")
+    table.cell(statusTable, 1, 5, strategy.position_size > 0 ? "多头" : strategy.position_size < 0 ? "空头" : "空仓")
+    table.cell(statusTable, 0, 6, "活动止损")
+    table.cell(statusTable, 1, 6, str.tostring(strategy.position_size > 0 ? activeLongStop : activeShortStop, format.mintick))
+    table.cell(statusTable, 0, 7, "最近退出原因")
+    table.cell(statusTable, 1, 7, lastExitReason)
+
+alertcondition(newHtfBuy and f_typeEnabled(htfEventCode), "交易级别B确认", "交易级别出现确认B")
+alertcondition(newHtfSell and f_typeEnabled(htfEventCode), "交易级别S确认", "交易级别出现确认S")
+alertcondition(newLtfSell and f_typeEnabled(ltfEventCode), "执行周期S预警", "执行周期出现S，可能触发高级别多头提前退出")
+alertcondition(newLtfBuy and f_typeEnabled(ltfEventCode), "执行周期B预警", "执行周期出现B，可能触发高级别空头提前退出")
