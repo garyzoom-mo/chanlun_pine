@@ -1,6 +1,6 @@
 //@version=6
-// 缠论多周期共振策略 v0.1.0
-// 交易级别 B 入场，执行级别 S 提前退出；所有订单只使用实际确认事件，不在历史拐点回填成交。
+// 缠论多周期共振策略 v0.2.0
+// 图表周期就是交易级别：交易级别 B/S 负责开仓，低级别只在主级别顶/底候选区辅助提前退出。
 strategy("缠论多周期共振回测 [Chanlun MTF Strategy]", "缠论MTF策略",
   overlay=true, pyramiding=0, initial_capital=100000,
   default_qty_type=strategy.fixed, default_qty_value=1,
@@ -13,16 +13,16 @@ strategy("缠论多周期共振回测 [Chanlun MTF Strategy]", "缠论MTF策略"
 // ============================================================
 
 string GROUP_TF = "1. 多周期"
-string executionTfInput = input.timeframe("60", "执行周期（必须等于图表周期）", group=GROUP_TF,
-  tooltip="策略订单始终在图表K线上执行。要做 日线+60分钟，请把图表设为60分钟，并在这里选择60")
-string tradeTfInput = input.timeframe("D", "交易级别", group=GROUP_TF,
-  tooltip="高级别严格缠论 B 用于入场，高级别反向信号也可退出。必须大于执行周期")
-bool requireLtfEntryInput = input.bool(false, "入场还要求执行周期同向B/S", group=GROUP_TF,
-  tooltip="关闭=交易级别B/S直接入场；开启=交易级别信号出现后，等待执行周期同向信号确认")
-int resonanceWindowInput = input.int(48, "低级别共振等待K线", minval=1, maxval=500, group=GROUP_TF,
-  tooltip="开启低级别入场确认后，高级别信号最多等待多少根执行周期K线")
-bool exitOnLtfOppositeInput = input.bool(true, "执行周期反向信号提前退出", group=GROUP_TF)
-bool exitOnHtfOppositeInput = input.bool(true, "交易级别反向信号退出", group=GROUP_TF)
+string tradeTfInput = input.timeframe("D", "交易级别（必须等于图表周期）", group=GROUP_TF,
+  tooltip="日线交易就把图表设为日线并选择D；4小时交易就把图表设为4小时并选择240。所有订单在该级别收盘执行")
+string auxiliaryTfInput = input.timeframe("60", "辅助观察周期", group=GROUP_TF,
+  tooltip="只提供交易级别内部的B/S结构，不直接开仓。必须小于交易级别，例如日线交易+60分钟辅助")
+int auxiliaryLookbackInput = input.int(2, "辅助信号有效交易K线数", minval=1, maxval=20, group=GROUP_TF,
+  tooltip="2表示当前或前1根交易级别K线内出现的辅助信号都算有效")
+int topBottomWindowInput = input.int(3, "主级别顶/底候选有效K线数", minval=1, maxval=20, group=GROUP_TF,
+  tooltip="辅助S只有在最近N根交易级别K线出现主级别顶分型候选后才能提前退出；辅助B镜像处理空头")
+bool earlyExitOnAuxInput = input.bool(true, "顶/底候选区内由辅助反向信号提前退出", group=GROUP_TF)
+bool exitOnTradeOppositeInput = input.bool(true, "交易级别正式反向信号退出", group=GROUP_TF)
 
 string GROUP_DIR = "2. 交易方向"
 string directionInput = input.string("只做多", "方向", options=["只做多", "只做空", "多空双向"], group=GROUP_DIR)
@@ -52,7 +52,7 @@ bool trailingStopInput = input.bool(true, "启用ATR移动止损", group=GROUP_R
 float trailAtrMultInput = input.float(3.0, "移动止损ATR倍数", minval=0.5, maxval=15.0, step=0.1, group=GROUP_RISK)
 float trailActivationAtrInput = input.float(1.0, "浮盈达到ATR倍数后启动移动止损", minval=0.0, maxval=10.0, step=0.25, group=GROUP_RISK)
 bool maxHoldingExitInput = input.bool(true, "启用最大持仓时间退出", group=GROUP_RISK)
-int maxHoldingBarsInput = input.int(240, "最大持仓执行周期K线数", minval=1, maxval=10000, group=GROUP_RISK)
+int maxHoldingBarsInput = input.int(240, "最大持仓交易级别K线数", minval=1, maxval=10000, group=GROUP_RISK)
 
 string GROUP_TEST = "5. 回测区间"
 // input.time 的 defval 必须是 const int；使用 UTC Unix 毫秒常量，避免数字版 timestamp() 被推断为 simple int。
@@ -332,6 +332,8 @@ f_strictEngine() =>
     var int lastEvaluatedMiddleOrig = -1
     var int buySequence = 0
     var int sellSequence = 0
+    var int topFractalSequence = 0
+    var int bottomFractalSequence = 0
     var int lastEventCode = 0
     var float lastEventPrice = na
     var float lastEventStop = na
@@ -376,8 +378,10 @@ f_strictEngine() =>
                   middleBar.high < leftBar.high and middleBar.high < rightBar.high
                 if topFractal
                     rawFractals.push(Fractal.new(middleIdx, middleBar.originalIndex, middleBar.high, FractalType.TOP))
+                    topFractalSequence += 1
                 if bottomFractal
                     rawFractals.push(Fractal.new(middleIdx, middleBar.originalIndex, middleBar.low, FractalType.BOTTOM))
+                    bottomFractalSequence += 1
 
                 if topFractal or bottomFractal
                     rebuiltStrokes = f_buildStrokes(rawFractals, minBarsForBiInput, minBiPriceChangeInput)
@@ -489,20 +493,12 @@ f_strictEngine() =>
                             lastEventStop := s3Stop
                             lastEventTime := time
 
-    [buySequence, sellSequence, lastEventCode, lastEventPrice, lastEventStop, lastEventTime]
+    [buySequence, sellSequence, topFractalSequence, bottomFractalSequence,
+      lastEventCode, lastEventPrice, lastEventStop, lastEventTime]
 
 // ============================================================
-// 多周期事件
+// 主交易级别 + 低级别辅助事件
 // ============================================================
-
-[ltfBuySeq, ltfSellSeq, ltfEventCode, _, _, _] = f_strictEngine()
-[htfBuySeq, htfSellSeq, htfEventCode, _, htfEventStop, _] = request.security(
-  syminfo.tickerid, tradeTfInput, f_strictEngine(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-
-newLtfBuy = ltfBuySeq > nz(ltfBuySeq[1], ltfBuySeq)
-newLtfSell = ltfSellSeq > nz(ltfSellSeq[1], ltfSellSeq)
-newHtfBuy = htfBuySeq > nz(htfBuySeq[1], htfBuySeq)
-newHtfSell = htfSellSeq > nz(htfSellSeq[1], htfSellSeq)
 
 f_typeEnabled(code) =>
     magnitude = math.abs(code)
@@ -518,52 +514,93 @@ f_signalName(code) =>
         -3 => "S3"
         => "--"
 
+// 主引擎直接运行在图表周期；所以图表周期就是实际交易级别。
+[tradeBuySeq, tradeSellSeq, tradeTopSeq, tradeBottomSeq,
+  tradeEventCode, _, tradeEventStop, _] = f_strictEngine()
+
+// 辅助周期返回当前每根交易K线内部的全部低级别结果。它只影响共振/提前退出，不直接下单。
+[auxBuySeqValues, auxSellSeqValues, _, _, auxCodeValues, _, _, _] = request.security_lower_tf(
+  syminfo.tickerid, auxiliaryTfInput, f_strictEngine(), ignore_invalid_timeframe=true)
+
+newTradeBuy = tradeBuySeq > nz(tradeBuySeq[1], tradeBuySeq)
+newTradeSell = tradeSellSeq > nz(tradeSellSeq[1], tradeSellSeq)
+newTradeTop = tradeTopSeq > nz(tradeTopSeq[1], tradeTopSeq)
+newTradeBottom = tradeBottomSeq > nz(tradeBottomSeq[1], tradeBottomSeq)
+
+// 从当前交易级别K线包含的低级别数组中提取“本周期是否出现过B/S”。
+var int seenAuxBuySeq = 0
+var int seenAuxSellSeq = 0
+bool auxBuyThisBar = false
+bool auxSellThisBar = false
+int auxEventCodeThisBar = 0
+int auxBuyCodeThisBar = 0
+int auxSellCodeThisBar = 0
+auxCount = auxBuySeqValues.size()
+if auxCount > 0
+    for auxIdx = 0 to auxCount - 1
+        auxBuySeq = nz(auxBuySeqValues.get(auxIdx), seenAuxBuySeq)
+        auxSellSeq = nz(auxSellSeqValues.get(auxIdx), seenAuxSellSeq)
+        auxCode = auxCodeValues.get(auxIdx)
+        if auxBuySeq > seenAuxBuySeq and auxCode > 0 and f_typeEnabled(auxCode)
+            auxBuyThisBar := true
+            auxBuyCodeThisBar := auxCode
+            auxEventCodeThisBar := auxCode
+        if auxSellSeq > seenAuxSellSeq and auxCode < 0 and f_typeEnabled(auxCode)
+            auxSellThisBar := true
+            auxSellCodeThisBar := auxCode
+            auxEventCodeThisBar := auxCode
+        seenAuxBuySeq := math.max(seenAuxBuySeq, auxBuySeq)
+        seenAuxSellSeq := math.max(seenAuxSellSeq, auxSellSeq)
+
+var int lastAuxBuyTradeBar = na
+var int lastAuxSellTradeBar = na
+var int lastTradeTopBar = na
+var int lastTradeBottomBar = na
+var int lastAuxEventCode = 0
+var int lastAuxBuyCode = 0
+var int lastAuxSellCode = 0
+
+if auxBuyThisBar
+    lastAuxBuyTradeBar := bar_index
+    lastAuxBuyCode := auxBuyCodeThisBar
+if auxSellThisBar
+    lastAuxSellTradeBar := bar_index
+    lastAuxSellCode := auxSellCodeThisBar
+if auxBuyThisBar or auxSellThisBar
+    lastAuxEventCode := auxEventCodeThisBar
+if newTradeTop
+    lastTradeTopBar := bar_index
+if newTradeBottom
+    lastTradeBottomBar := bar_index
+
+auxBuyRecent = not na(lastAuxBuyTradeBar) and bar_index - lastAuxBuyTradeBar < auxiliaryLookbackInput
+auxSellRecent = not na(lastAuxSellTradeBar) and bar_index - lastAuxSellTradeBar < auxiliaryLookbackInput
+tradeTopCandidate = not na(lastTradeTopBar) and bar_index - lastTradeTopBar < topBottomWindowInput
+tradeBottomCandidate = not na(lastTradeBottomBar) and bar_index - lastTradeBottomBar < topBottomWindowInput
+
+// 唯一开仓来源：交易级别正式B/S。低级别B/S绝不直接开仓。
+longEntryEvent = newTradeBuy and f_typeEnabled(tradeEventCode)
+shortEntryEvent = newTradeSell and f_typeEnabled(tradeEventCode)
+
+// 辅助反向信号必须同时处于主级别顶/底候选窗口，才有提前退出权限。
+earlyLongExitEvent = earlyExitOnAuxInput and tradeTopCandidate and auxSellRecent
+earlyShortExitEvent = earlyExitOnAuxInput and tradeBottomCandidate and auxBuyRecent
+
 chartSeconds = timeframe.in_seconds()
-executionSeconds = timeframe.in_seconds(executionTfInput)
 tradeSeconds = timeframe.in_seconds(tradeTfInput)
-timeframeMatches = chartSeconds == executionSeconds
-validHierarchy = tradeSeconds > executionSeconds
+auxiliarySeconds = timeframe.in_seconds(auxiliaryTfInput)
+timeframeMatches = chartSeconds == tradeSeconds
+validHierarchy = auxiliarySeconds < tradeSeconds
 configurationValid = timeframeMatches and validHierarchy
 inBacktestWindow = time >= startTimeInput and time <= endTimeInput
 allowLong = directionInput == "只做多" or directionInput == "多空双向"
 allowShort = directionInput == "只做空" or directionInput == "多空双向"
 
-// 可选共振等待：高级别信号打开窗口，执行级别同向信号完成入场。
-var int pendingLongUntil = na
-var int pendingShortUntil = na
-var int pendingLongCode = 0
-var int pendingShortCode = 0
-var float pendingLongStop = na
-var float pendingShortStop = na
-if newHtfBuy and f_typeEnabled(htfEventCode)
-    pendingLongUntil := bar_index + resonanceWindowInput
-    pendingLongCode := htfEventCode
-    pendingLongStop := htfEventStop
-if newHtfSell and f_typeEnabled(htfEventCode)
-    pendingShortUntil := bar_index + resonanceWindowInput
-    pendingShortCode := htfEventCode
-    pendingShortStop := htfEventStop
-
-longEntryEvent = newHtfBuy and f_typeEnabled(htfEventCode)
-shortEntryEvent = newHtfSell and f_typeEnabled(htfEventCode)
-if requireLtfEntryInput
-    longEntryEvent := not na(pendingLongUntil) and bar_index <= pendingLongUntil and newLtfBuy and f_typeEnabled(ltfEventCode)
-    shortEntryEvent := not na(pendingShortUntil) and bar_index <= pendingShortUntil and newLtfSell and f_typeEnabled(ltfEventCode)
-
-if not na(pendingLongUntil) and bar_index > pendingLongUntil
-    pendingLongUntil := na
-    pendingLongCode := 0
-    pendingLongStop := na
-if not na(pendingShortUntil) and bar_index > pendingShortUntil
-    pendingShortUntil := na
-    pendingShortCode := 0
-    pendingShortStop := na
-
 // ============================================================
 // 仓位和完整退出链
 // ============================================================
 
-atrExecution = ta.atr(atrPeriodInput)
+atrTrade = ta.atr(atrPeriodInput)
 pointValue = math.max(syminfo.pointvalue, 1e-9)
 
 f_positionQty(entryPrice, stopPrice) =>
@@ -582,54 +619,48 @@ var float activeShortStop = na
 var int entryBarIndex = na
 var string lastExitReason = "--"
 
-// 高级别B/S负责开仓。若结构止损位在入场价错误一侧，则回退到执行周期ATR止损。
+// 只有图表/交易级别正式B/S能开仓。结构止损若位于错误一侧，则回退到交易级别ATR止损。
 if configurationValid and inBacktestWindow
     if longEntryEvent and allowLong and strategy.position_size <= 0
-        entryCode = requireLtfEntryInput ? pendingLongCode : htfEventCode
-        candidateStop = requireLtfEntryInput ? pendingLongStop : htfEventStop
+        candidateStop = tradeEventStop
         if na(candidateStop) or candidateStop >= close
-            candidateStop := close - atrExecution * initialAtrMultInput
+            candidateStop := close - atrTrade * initialAtrMultInput
         qty = f_positionQty(close, candidateStop)
         if qty > 0
-            strategy.entry("Long", strategy.long, qty=qty, comment=f_signalName(entryCode))
+            strategy.entry("Long", strategy.long, qty=qty, comment=f_signalName(tradeEventCode))
             longInitialStop := candidateStop
             highSinceEntry := high
             activeLongStop := candidateStop
             entryBarIndex := bar_index
-            pendingLongUntil := na
-            pendingLongCode := 0
-            pendingLongStop := na
 
     if shortEntryEvent and allowShort and strategy.position_size >= 0
-        entryCode = requireLtfEntryInput ? pendingShortCode : htfEventCode
-        candidateStop = requireLtfEntryInput ? pendingShortStop : htfEventStop
+        candidateStop = tradeEventStop
         if na(candidateStop) or candidateStop <= close
-            candidateStop := close + atrExecution * initialAtrMultInput
+            candidateStop := close + atrTrade * initialAtrMultInput
         qty = f_positionQty(close, candidateStop)
         if qty > 0
-            strategy.entry("Short", strategy.short, qty=qty, comment=f_signalName(entryCode))
+            strategy.entry("Short", strategy.short, qty=qty, comment=f_signalName(tradeEventCode))
             shortInitialStop := candidateStop
             lowSinceEntry := low
             activeShortStop := candidateStop
             entryBarIndex := bar_index
-            pendingShortUntil := na
-            pendingShortCode := 0
-            pendingShortStop := na
 
 if strategy.position_size > 0
     highSinceEntry := na(highSinceEntry) ? high : math.max(highSinceEntry, high)
     activeLongStop := longInitialStop
-    trailActivated = trailingStopInput and highSinceEntry - strategy.position_avg_price >= atrExecution * trailActivationAtrInput
+    trailActivated = trailingStopInput and highSinceEntry - strategy.position_avg_price >= atrTrade * trailActivationAtrInput
     if trailActivated
-        activeLongStop := math.max(activeLongStop, highSinceEntry - atrExecution * trailAtrMultInput)
+        activeLongStop := math.max(activeLongStop, highSinceEntry - atrTrade * trailAtrMultInput)
     strategy.exit("L-Risk", "Long", stop=activeLongStop, comment="结构/ATR止损")
 
     reversingToShort = shortEntryEvent and allowShort
-    if exitOnLtfOppositeInput and newLtfSell and f_typeEnabled(ltfEventCode) and not reversingToShort
-        lastExitReason := "执行周期" + f_signalName(ltfEventCode)
+    auxExitAfterEntry = earlyLongExitEvent and not na(entryBarIndex) and
+      lastAuxSellTradeBar >= entryBarIndex and lastTradeTopBar >= entryBarIndex
+    if auxExitAfterEntry and not reversingToShort
+        lastExitReason := "辅助" + f_signalName(lastAuxSellCode) + "+主级别顶候选"
         strategy.close("Long", comment=lastExitReason)
-    else if exitOnHtfOppositeInput and newHtfSell and f_typeEnabled(htfEventCode) and not reversingToShort
-        lastExitReason := "交易级别" + f_signalName(htfEventCode)
+    else if exitOnTradeOppositeInput and newTradeSell and f_typeEnabled(tradeEventCode) and not reversingToShort
+        lastExitReason := "交易级别" + f_signalName(tradeEventCode)
         strategy.close("Long", comment=lastExitReason)
     else if maxHoldingExitInput and not na(entryBarIndex) and bar_index - entryBarIndex >= maxHoldingBarsInput
         lastExitReason := "最大持仓时间"
@@ -638,17 +669,19 @@ if strategy.position_size > 0
 if strategy.position_size < 0
     lowSinceEntry := na(lowSinceEntry) ? low : math.min(lowSinceEntry, low)
     activeShortStop := shortInitialStop
-    trailActivated = trailingStopInput and strategy.position_avg_price - lowSinceEntry >= atrExecution * trailActivationAtrInput
+    trailActivated = trailingStopInput and strategy.position_avg_price - lowSinceEntry >= atrTrade * trailActivationAtrInput
     if trailActivated
-        activeShortStop := math.min(activeShortStop, lowSinceEntry + atrExecution * trailAtrMultInput)
+        activeShortStop := math.min(activeShortStop, lowSinceEntry + atrTrade * trailAtrMultInput)
     strategy.exit("S-Risk", "Short", stop=activeShortStop, comment="结构/ATR止损")
 
     reversingToLong = longEntryEvent and allowLong
-    if exitOnLtfOppositeInput and newLtfBuy and f_typeEnabled(ltfEventCode) and not reversingToLong
-        lastExitReason := "执行周期" + f_signalName(ltfEventCode)
+    auxExitAfterEntry = earlyShortExitEvent and not na(entryBarIndex) and
+      lastAuxBuyTradeBar >= entryBarIndex and lastTradeBottomBar >= entryBarIndex
+    if auxExitAfterEntry and not reversingToLong
+        lastExitReason := "辅助" + f_signalName(lastAuxBuyCode) + "+主级别底候选"
         strategy.close("Short", comment=lastExitReason)
-    else if exitOnHtfOppositeInput and newHtfBuy and f_typeEnabled(htfEventCode) and not reversingToLong
-        lastExitReason := "交易级别" + f_signalName(htfEventCode)
+    else if exitOnTradeOppositeInput and newTradeBuy and f_typeEnabled(tradeEventCode) and not reversingToLong
+        lastExitReason := "交易级别" + f_signalName(tradeEventCode)
         strategy.close("Short", comment=lastExitReason)
     else if maxHoldingExitInput and not na(entryBarIndex) and bar_index - entryBarIndex >= maxHoldingBarsInput
         lastExitReason := "最大持仓时间"
@@ -675,38 +708,57 @@ if closeAtEndInput and time >= endTimeInput and strategy.position_size != 0
 plot(strategy.position_size > 0 ? activeLongStop : na, "多头活动止损", color=color.lime, linewidth=2, style=plot.style_linebr)
 plot(strategy.position_size < 0 ? activeShortStop : na, "空头活动止损", color=color.red, linewidth=2, style=plot.style_linebr)
 
-plotshape(newHtfBuy and f_typeEnabled(htfEventCode), "交易级别B确认", shape.labelup, location.belowbar,
-  color=color.new(color.green, 0), text="HTF B", textcolor=color.white, size=size.small)
-plotshape(newHtfSell and f_typeEnabled(htfEventCode), "交易级别S确认", shape.labeldown, location.abovebar,
-  color=color.new(color.red, 0), text="HTF S", textcolor=color.white, size=size.small)
-plotshape(newLtfBuy and f_typeEnabled(ltfEventCode), "执行周期B确认", shape.triangleup, location.belowbar,
-  color=color.new(color.lime, 0), text="LTF B", textcolor=color.black, size=size.tiny)
-plotshape(newLtfSell and f_typeEnabled(ltfEventCode), "执行周期S确认", shape.triangledown, location.abovebar,
-  color=color.new(color.orange, 0), text="LTF S", textcolor=color.white, size=size.tiny)
+plotshape(newTradeBuy and f_typeEnabled(tradeEventCode), "交易级别B确认", shape.labelup, location.belowbar,
+  color=color.new(color.green, 0), text="交易B", textcolor=color.white, size=size.small)
+plotshape(newTradeSell and f_typeEnabled(tradeEventCode), "交易级别S确认", shape.labeldown, location.abovebar,
+  color=color.new(color.red, 0), text="交易S", textcolor=color.white, size=size.small)
+plotshape(newTradeTop, "交易级别顶候选", shape.diamond, location.abovebar,
+  color=color.new(color.fuchsia, 0), text="顶候选", textcolor=color.white, size=size.tiny)
+plotshape(newTradeBottom, "交易级别底候选", shape.diamond, location.belowbar,
+  color=color.new(color.aqua, 0), text="底候选", textcolor=color.black, size=size.tiny)
+
+// 辅助信号画在其所属交易级别K线上；只表示该日/该主K线内部曾出现，不是独立成交点。
+plotshape(auxBuyThisBar, "辅助周期B", shape.triangleup, location.belowbar,
+  color=color.new(color.lime, 25), text="辅B", textcolor=color.black, size=size.tiny)
+plotshape(auxSellThisBar, "辅助周期S", shape.triangledown, location.abovebar,
+  color=color.new(color.orange, 15), text="辅S", textcolor=color.white, size=size.tiny)
+plotshape(earlyLongExitEvent and strategy.position_size > 0, "辅助S提前平多", shape.flag, location.abovebar,
+  color=color.orange, text="辅S平多", textcolor=color.white, size=size.small)
+plotshape(earlyShortExitEvent and strategy.position_size < 0, "辅助B提前平空", shape.flag, location.belowbar,
+  color=color.aqua, text="辅B平空", textcolor=color.black, size=size.small)
 
 bgcolor(not configurationValid ? color.new(color.orange, 82) : na, title="周期配置错误")
 
-var table statusTable = table.new(position.top_right, 2, 8, border_width=1)
+candidateText = tradeTopCandidate ? "顶部候选" : tradeBottomCandidate ? "底部候选" : "无"
+auxRecentText = auxSellRecent ? "近期辅助S" : auxBuyRecent ? "近期辅助B" : "无"
+
+var table statusTable = table.new(position.top_right, 2, 10, border_width=1)
 if barstate.islast
-    table.cell(statusTable, 0, 0, "缠论MTF策略", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTable, 0, 0, "缠论主级别策略", text_color=color.white, bgcolor=color.gray)
     table.cell(statusTable, 1, 0, configurationValid ? "配置正常" : "⚠ 周期错误",
       text_color=color.white, bgcolor=configurationValid ? color.new(color.green, 30) : color.new(color.red, 20))
-    table.cell(statusTable, 0, 1, "图表/执行周期")
-    table.cell(statusTable, 1, 1, timeframe.period + " / " + executionTfInput)
-    table.cell(statusTable, 0, 2, "交易级别")
-    table.cell(statusTable, 1, 2, tradeTfInput)
-    table.cell(statusTable, 0, 3, "最近高级别")
-    table.cell(statusTable, 1, 3, f_signalName(htfEventCode))
-    table.cell(statusTable, 0, 4, "最近执行级别")
-    table.cell(statusTable, 1, 4, f_signalName(ltfEventCode))
-    table.cell(statusTable, 0, 5, "当前仓位")
-    table.cell(statusTable, 1, 5, strategy.position_size > 0 ? "多头" : strategy.position_size < 0 ? "空头" : "空仓")
-    table.cell(statusTable, 0, 6, "活动止损")
-    table.cell(statusTable, 1, 6, str.tostring(strategy.position_size > 0 ? activeLongStop : activeShortStop, format.mintick))
-    table.cell(statusTable, 0, 7, "最近退出原因")
-    table.cell(statusTable, 1, 7, lastExitReason)
+    table.cell(statusTable, 0, 1, "图表/交易级别")
+    table.cell(statusTable, 1, 1, timeframe.period + " / " + tradeTfInput)
+    table.cell(statusTable, 0, 2, "辅助周期")
+    table.cell(statusTable, 1, 2, auxiliaryTfInput)
+    table.cell(statusTable, 0, 3, "最近交易信号")
+    table.cell(statusTable, 1, 3, f_signalName(tradeEventCode))
+    table.cell(statusTable, 0, 4, "最近辅助信号")
+    table.cell(statusTable, 1, 4, f_signalName(lastAuxEventCode))
+    table.cell(statusTable, 0, 5, "主级别候选")
+    table.cell(statusTable, 1, 5, candidateText)
+    table.cell(statusTable, 0, 6, "辅助有效状态")
+    table.cell(statusTable, 1, 6, auxRecentText)
+    table.cell(statusTable, 0, 7, "当前仓位")
+    table.cell(statusTable, 1, 7, strategy.position_size > 0 ? "多头" : strategy.position_size < 0 ? "空头" : "空仓")
+    table.cell(statusTable, 0, 8, "活动止损")
+    table.cell(statusTable, 1, 8, str.tostring(strategy.position_size > 0 ? activeLongStop : activeShortStop, format.mintick))
+    table.cell(statusTable, 0, 9, "最近退出原因")
+    table.cell(statusTable, 1, 9, lastExitReason)
 
-alertcondition(newHtfBuy and f_typeEnabled(htfEventCode), "交易级别B确认", "交易级别出现确认B")
-alertcondition(newHtfSell and f_typeEnabled(htfEventCode), "交易级别S确认", "交易级别出现确认S")
-alertcondition(newLtfSell and f_typeEnabled(ltfEventCode), "执行周期S预警", "执行周期出现S，可能触发高级别多头提前退出")
-alertcondition(newLtfBuy and f_typeEnabled(ltfEventCode), "执行周期B预警", "执行周期出现B，可能触发高级别空头提前退出")
+alertcondition(newTradeBuy and f_typeEnabled(tradeEventCode), "交易级别B确认", "图表/交易级别出现确认B")
+alertcondition(newTradeSell and f_typeEnabled(tradeEventCode), "交易级别S确认", "图表/交易级别出现确认S")
+alertcondition(auxSellThisBar, "辅助周期S预警", "当前交易级别K线内部出现辅助周期S")
+alertcondition(auxBuyThisBar, "辅助周期B预警", "当前交易级别K线内部出现辅助周期B")
+alertcondition(earlyLongExitEvent and strategy.position_size > 0, "辅助S提前平多", "主级别顶部候选区内出现辅助S，策略将在主级别收盘平多")
+alertcondition(earlyShortExitEvent and strategy.position_size < 0, "辅助B提前平空", "主级别底部候选区内出现辅助B，策略将在主级别收盘平空")
