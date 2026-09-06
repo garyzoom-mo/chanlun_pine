@@ -55,8 +55,9 @@ bool maxHoldingExitInput = input.bool(true, "启用最大持仓时间退出", gr
 int maxHoldingBarsInput = input.int(240, "最大持仓执行周期K线数", minval=1, maxval=10000, group=GROUP_RISK)
 
 string GROUP_TEST = "5. 回测区间"
-int startTimeInput = input.time(timestamp(2022, 1, 1, 0, 0), "开始时间", group=GROUP_TEST)
-int endTimeInput = input.time(timestamp(2030, 12, 31, 23, 59), "结束时间", group=GROUP_TEST)
+// input.time 的 defval 必须是 const int；使用 UTC Unix 毫秒常量，避免数字版 timestamp() 被推断为 simple int。
+int startTimeInput = input.time(1640995200000, "开始时间", group=GROUP_TEST)  // 2022-01-01 00:00 UTC
+int endTimeInput = input.time(1924991940000, "结束时间", group=GROUP_TEST)    // 2030-12-31 23:59 UTC
 bool closeAtEndInput = input.bool(true, "回测结束强制平仓", group=GROUP_TEST)
 
 // ============================================================
