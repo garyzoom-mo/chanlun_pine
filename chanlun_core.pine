@@ -167,7 +167,7 @@ type Prediction
 
 // 调试开关（默认关闭，测试用）
 bool showContainmentDebug = input.bool(false, "显示包含处理过程", group="调试", tooltip="开启后高亮被合并的K线，显示合并前后对比")
-bool showFractalLabels    = input.bool(true,  "显示分型文字标签",  group="调试", tooltip="显示顶/底分型的文字标签。关闭后只保留三角标记")
+bool showFractalLabels    = input.bool(false, "显示分型文字标签",  group="调试", tooltip="显示顶/底分型的文字标签。每个分型占用 1 个 label 配额，图上分型数量远多于买卖点，开启后会挤掉 B/S 信号标签（TradingView 上限 500，只保留最新创建的）。默认关闭，只保留红▼/绿▲三角")
 bool showBuildBiDebugInput = input.bool(false, "显示 buildBi 诊断日志", group="调试",
     tooltip="在 needFullRebuild 时打印 buildBi 两阶段扫描的诊断日志，用于验证笔构建逻辑。默认关闭，测试场景 A/B/C 时开启")
 
@@ -1530,15 +1530,18 @@ if needFullRebuild
     fi = 0
     ti = 0
     si = 0
+    // 关闭开关的信号流"可用长度"直接置 0，保证 while 条件与哨兵值口径一致。
+    // 否则 tb/sb 恒为 infinity 但 ti<tn 仍成立 → 循环末尾三路全 infinity
+    // → 走第一分支 firstSignals.get(fn) 越界，脚本直接运行时报错。
     fn = firstSignals.size()
-    tn = thirdSignals.size()
-    sn = secondSignals.size()
+    tn = showB3Input ? thirdSignals.size() : 0
+    sn = showB2Input ? secondSignals.size() : 0
     infinity = 99999999
 
     while fi < fn or ti < tn or si < sn
         fb = fi < fn ? firstSignals.get(fi).barIndex : infinity
-        tb = showB3Input and ti < tn ? thirdSignals.get(ti).barIndex : infinity
-        sb = showB2Input and si < sn ? secondSignals.get(si).barIndex : infinity
+        tb = ti < tn ? thirdSignals.get(ti).barIndex : infinity
+        sb = si < sn ? secondSignals.get(si).barIndex : infinity
 
         if fb <= tb and fb <= sb
             allRaw.push(firstSignals.get(fi))
@@ -1755,6 +1758,40 @@ if needFullRebuild
             )
             beiChiLabels.push(bcLabel)
 
+// --- 4c. 分型文字标签 ---
+// 策略：与笔线/中枢/背驰/信号标签一致，needFullRebuild 时删除重建。
+// plotshape 三角标记保持声明式（不泄漏）。
+if needFullRebuild
+    for oldLabel in fractalLabels
+        oldLabel.delete()
+    fractalLabels.clear()
+
+    if showFractalLabels
+        for f in fractals
+            fTime = barTimes.get(f.originalIndex)
+            if f.fType == FractalType.TOP
+                fractalLabels.push(label.new(
+                  fTime, f.price,
+                  "顶",
+                  style=label.style_label_down,
+                  color=color.red,
+                  textcolor=color.white,
+                  size=size.small,
+                  xloc=xloc.bar_time,
+                  yloc=yloc.abovebar
+                ))
+            else if f.fType == FractalType.BOTTOM
+                fractalLabels.push(label.new(
+                  fTime, f.price,
+                  "底",
+                  style=label.style_label_up,
+                  color=color.green,
+                  textcolor=color.white,
+                  size=size.small,
+                  xloc=xloc.bar_time,
+                  yloc=yloc.belowbar
+                ))
+
 // --- 4b. 买卖点信号标记 ---
 // 策略：与背驰/中枢可视化一致，needFullRebuild 时删除重建。
 // B1/B2/B3 绿色系，S1/S2/S3 红色系，强度递减（透明度递增）。
@@ -1875,40 +1912,6 @@ if needFullRebuild
               xloc=xloc.bar_time
             )
             signalLabels.push(sigLabel)
-
-// --- 4c. 分型文字标签 ---
-// 策略：与笔线/中枢/背驰/信号标签一致，needFullRebuild 时删除重建。
-// plotshape 三角标记保持声明式（不泄漏）。
-if needFullRebuild
-    for oldLabel in fractalLabels
-        oldLabel.delete()
-    fractalLabels.clear()
-
-    if showFractalLabels
-        for f in fractals
-            fTime = barTimes.get(f.originalIndex)
-            if f.fType == FractalType.TOP
-                fractalLabels.push(label.new(
-                  fTime, f.price,
-                  "顶",
-                  style=label.style_label_down,
-                  color=color.red,
-                  textcolor=color.white,
-                  size=size.small,
-                  xloc=xloc.bar_time,
-                  yloc=yloc.abovebar
-                ))
-            else if f.fType == FractalType.BOTTOM
-                fractalLabels.push(label.new(
-                  fTime, f.price,
-                  "底",
-                  style=label.style_label_up,
-                  color=color.green,
-                  textcolor=color.white,
-                  size=size.small,
-                  xloc=xloc.bar_time,
-                  yloc=yloc.belowbar
-                ))
 
 // 清理调试标签：每次 needFullRebuild 时清空旧标签。
 // 注意：清空后历史 bar 的调试标签不会自动重建（per-bar 逻辑只对当前 bar_index 生效），
@@ -2063,8 +2066,42 @@ for f in fractals
         isBottomFractal := f.fType == FractalType.BOTTOM
         break
 
-plotshape(isTopFractal, "顶分型", shape.triangledown, location.abovebar, color.red, size=size.small, offset=0)
-plotshape(isBottomFractal, "底分型", shape.triangleup, location.belowbar, color.green, size=size.small, offset=0)
+plotshape(isTopFractal, "顶分型", shape.triangledown, location.abovebar, color.new(color.red, 45), size=size.tiny, offset=0)
+plotshape(isBottomFractal, "底分型", shape.triangleup, location.belowbar, color.new(color.green, 45), size=size.tiny, offset=0)
+
+// --- 7b. 买卖点 plotshape 标记（不占用 label 配额）---
+// label.new 受 max_labels_count=500 硬上限约束，历史较长时最早的买卖点标签会被
+// TradingView 自动回收。plotshape 是声明式绘制，没有数量上限，因此这里为每个
+// 买卖点额外画一个 B/S 标记，保证任意缩放下买卖点都不会"消失"。
+// 位置：买点画在K线下方，卖点画在K线上方，与分型三角错开避免互相遮挡。
+bool sigBuyHere  = false
+bool sigSellHere = false
+string sigTextHere = ""
+
+for sig in allFilteredSignals
+    if sig.barIndex == bar_index
+        isB = sig.sType == SignalType.B1 or sig.sType == SignalType.B2 or sig.sType == SignalType.B3
+        isS = sig.sType == SignalType.S1 or sig.sType == SignalType.S2 or sig.sType == SignalType.S3
+        if (isB and showBuySignalsInput) or (isS and showSellSignalsInput)
+            sigBuyHere  := isB
+            sigSellHere := isS
+            sigTextHere := switch sig.sType
+                SignalType.B1 => "B1"
+                SignalType.B2 => "B2"
+                SignalType.B3 => "B3"
+                SignalType.S1 => "S1"
+                SignalType.S2 => "S2"
+                SignalType.S3 => "S3"
+            break
+
+plotshape(sigBuyHere,  "买点标记", shape.labelup,   location.belowbar,
+  color.new(color.lime, 0), text="B", textcolor=color.black, size=size.small, offset=0)
+plotshape(sigSellHere, "卖点标记", shape.labeldown, location.abovebar,
+  color.new(color.red, 0),  text="S", textcolor=color.white, size=size.small, offset=0)
+
+// 买卖点专用 alert 条件（可在 TradingView 告警面板直接选择）
+alertcondition(sigBuyHere,  "缠论买点触发", "缠论买点触发")
+alertcondition(sigSellHere, "缠论卖点触发", "缠论卖点触发")
 
 // --- 8. 调试模式：包含处理前后对比 ---
 // 关闭调试模式时，所有辅助元素隐藏，不影响正常看图
